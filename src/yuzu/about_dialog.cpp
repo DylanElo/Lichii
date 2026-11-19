@@ -33,8 +33,10 @@ AboutDialog::AboutDialog(QWidget* parent)
         ui->labelBuildInfo->text().arg(QString::fromStdString(yuzu_build_version),
                                        QString::fromUtf8(Common::g_build_date).left(10)));
     if (FritchiiUi::Enabled()) {
-        setWindowTitle(tr("About Fritchii"));
-        ui->labelYuzu->setText(QStringLiteral("<span style='font-size:30px'>Fritchii</span>"));
+        setWindowTitle(tr("About Lichii RTX 2060"));
+        ui->labelYuzu->setText(tr("<span style='font-size:30px'>Lichii RTX 2060</span><br>"
+                                  "DylanElo's modified build of Fritchii v6.2<br>"
+                                  "Shader precompile system by Frizti (Fritchii)"));
     }
 }
 
