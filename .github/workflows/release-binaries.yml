@@ -378,12 +378,25 @@ jobs:
           key: ${{ steps.cpm-cache.outputs.cache-primary-key }}
 
       - name: Build
-        if: ${{ ! matrix.mingw }}
+        if: ${{ !matrix.mingw && !matrix.fritchii }}
         shell: bash
         run: |
           if command -v ccache > /dev/null; then ccache --zero-stats; else sccache --zero-stats; fi
-          cmake --build build/release --target yuzu ${{ !matrix.fritchii && 'yuzu-cmd' || '' }} --parallel
+          cmake --build build/release --target yuzu yuzu-cmd --parallel
           if command -v ccache > /dev/null; then ccache --show-stats; else sccache --show-stats; fi
+
+      - name: Build personal Windows GUI
+        if: matrix.fritchii
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake --build build/release --target src/video_core/nx2_shader_stamp.h
+          sccache --zero-stats
+          # Show Ninja's progress, then the full failing command and its diagnostics on error.
+          cmake --build build/release --target yuzu --parallel 2>&1 |
+            awk '/^FAILED:|^ninja:|^CMake Error/ { failed = 1 }
+                 failed || /^\[[0-9]+\/[0-9]+\]/ { print; fflush() }'
+          sccache --show-stats
 
       - name: Build MinGW PGO
         if: matrix.mingw
@@ -475,6 +488,11 @@ jobs:
             }
           }
           windeployqt --release --no-translations build/release/bin/fritchii.exe
+
+      - name: Include personal build licenses
+        if: matrix.fritchii
+        shell: pwsh
+        run: Copy-Item -LiteralPath LICENSE.txt,LICENSES/Fritchii-Additional-Terms.txt -Destination build/release/bin/
 
       # A dynamic MinGW build is not portable on its own: windeployqt6 brings the Qt libraries and
       # plugins, then every non-system DLL the binaries and those plugins pull in gets copied next to
