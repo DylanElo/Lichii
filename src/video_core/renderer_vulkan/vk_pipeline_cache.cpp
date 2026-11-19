@@ -20,6 +20,7 @@
 #include <span>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 #include <bit>
@@ -39,6 +40,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/frizti_settings.h"
 #include "common/host_memory.h"
 #include "common/memory_detect.h"
 #include "common/shutdown_progress.h"
@@ -83,6 +85,7 @@
 #include "video_core/renderer_vulkan/vk_precompiled_kept.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/pipeline_optimization.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
@@ -805,6 +808,11 @@ bool GraphicsPipelineCacheKey::operator==(const GraphicsPipelineCacheKey& rhs) c
 }
 
 namespace {
+bool PreferSlowOot2060Graphics(const Device& device, u64 title_id) {
+    return title_id == Settings::Frizti::OcarinaOfTimeProgramId &&
+           device.GetDriverID() == VK_DRIVER_ID_NVIDIA_PROPRIETARY && device.GetDeviceID() == 0x1f11;
+}
+
 // NVIDIA's and AMD's drivers keep a disk cache of built pipelines of their own. The emulator's copy on top
 // only kept every pipeline the title ever built in host memory (title 1: a 245 MB file, ~0.35 GB
 // of RAM for the session) and copied it whole at each save, which stalled frames; pipelines built
@@ -2567,6 +2575,9 @@ PipelineCache::~PipelineCache() {
     translate_queue.reset();
     StopBackgroundPipelines();
     Common::NoteShutdownProgress();
+    if (cold_compute_worker) {
+        cold_compute_worker->WaitForRequests();
+    }
     workers.WaitForRequests();
     serialization_thread.WaitForRequests();
     Common::NoteShutdownProgress();
@@ -4919,12 +4930,16 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             callback(VideoCore::LoadCallbackStage::Build, state.built, state.total);
         }
     }};
+    const bool prefer_slow_graphics = PreferSlowOot2060Graphics(device, title_id);
+    size_t slow_graphics_records = 0;
     const auto queue_graphics{[&](const GraphicsPipelineCacheKey& key, DiskRecords records) {
         const u64 hash = key.Hash();
         disk_pipelines.insert(hash);
-        if (!PreloadAllPipelines() &&
-            (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
-                                    : !used_pipelines.contains(hash))) {
+        const bool slow = prefer_slow_graphics && VideoCommon::IsSlowOot2060GraphicsKey(hash);
+        slow_graphics_records += slow;
+        const bool skip = used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
+                                                 : !used_pipelines.contains(hash) && !slow;
+        if (!PreloadAllPipelines() && skip) {
             ++skipped_pipelines;
             if (BackgroundPipelinesEnabled()) {
                 deferred_graphics.emplace_back(key, std::move(records));
@@ -4959,6 +4974,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                                                      false);
     }
     const auto queue_all_graphics = [&] {
+        if (prefer_slow_graphics && used_pipelines.empty() && !PreloadAllPipelines() &&
+            graphics_records.size() > MaxPipelinesWithoutUsedList) {
+            std::ranges::stable_partition(graphics_records, [](const auto& record) {
+                return VideoCommon::IsSlowOot2060GraphicsKey(record.first.Hash());
+            });
+        }
         for (auto& [key, records] : graphics_records) {
             std::ranges::reverse(records.envs);
             std::ranges::reverse(records.refs);
@@ -5030,6 +5051,16 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+    if (prefer_slow_graphics && !stop_loading.stop_requested()) {
+        std::scoped_lock state_lock{state.mutex};
+        const auto ready = std::ranges::count_if(graphics_cache, [](const auto& entry) {
+            const auto& [key, pipeline] = entry;
+            return pipeline && pipeline->IsBuilt() && !pipeline->Failed() &&
+                   VideoCommon::IsSlowOot2060GraphicsKey(key.Hash());
+        });
+        LOG_INFO(Render_Vulkan, "RTX 2060 graphics prebuild: {} ready, {} recorded slow states found",
+                 ready, slow_graphics_records);
+    }
     LOG_INFO(Render_Vulkan, "Prebuild: {} boot builds done {:.1f} s after the disk cache load began{}",
              state.total, SecondsSinceDiskLoad(),
              boot_stream ? "; records streamed: " + StreamTotalsText(boot_stream->Totals())
@@ -8370,43 +8401,54 @@ void PipelineCache::EvictUnusedPipelines() {
     const size_t unused_budget =
         keep_switch > 0 ? (std::min)(static_cast<size_t>(keep_switch), MaxUnusedPrebuiltPipelines)
                         : MaxUnusedPrebuiltPipelines;
-    size_t kept_prebuilt = 0;
-    size_t unused_candidates = 0;
-    std::vector<std::pair<u64, GraphicsPipelineCacheKey>> candidates;
+    struct Candidate {
+        const GraphicsPipelineCacheKey* key;
+        u64 last_use;
+        bool unused;
+        bool slow;
+    };
+    const bool prefer_slow_graphics = PreferSlowOot2060Graphics(device, visual_workaround_title);
+    std::vector<Candidate> prebuilt;
+    std::vector<Candidate> candidates;
     for (const auto& [key, pipeline] : graphics_cache) {
         if (pipeline == nullptr || pipeline.get() == current_pipeline || !pipeline->IsBuilt() ||
             pipeline->LastUse() >= cutoff) {
             continue;
         }
-        if (!pipeline->WasUsed()) {
-            if (kept_prebuilt < unused_budget) {
-                ++kept_prebuilt;
-                continue;
-            }
-            // With the switch on they go first (sort key 0), whatever their build frame.
-            ++unused_candidates;
-            candidates.emplace_back(keep_switch > 0 ? 0 : pipeline->LastUse(), key);
-            continue;
-        }
-        if (over) {
-            candidates.emplace_back(pipeline->LastUse(), key);
+        const bool slow = prefer_slow_graphics && !pipeline->Failed() &&
+                          VideoCommon::IsSlowOot2060GraphicsKey(key.Hash());
+        const Candidate candidate{&key, pipeline->LastUse(), !pipeline->WasUsed(), slow};
+        if (candidate.unused) {
+            prebuilt.push_back(candidate);
+        } else if (over) {
+            candidates.push_back(candidate);
         }
     }
+    const auto surplus = VideoCommon::GraphicsPrebuildsOverBudget(
+        std::span{prebuilt}, unused_budget, &Candidate::slow);
+    candidates.insert(candidates.end(), surplus.begin(), surplus.end());
     size_t evicted = over ? VideoCommon::GraphicsPipelinesToEvict(graphics_cache.size(),
                                                                   candidates.size(), evict_above)
                           : 0;
     if (keep_switch > 0) {
-        evicted = (std::max)(evicted, unused_candidates);
+        evicted = (std::max)(evicted, surplus.size());
     }
     if (evicted == 0) {
         return;
     }
-    std::nth_element(candidates.begin(), candidates.begin() + (evicted - 1), candidates.end(),
-                     [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+    std::ranges::nth_element(candidates, candidates.begin() + (evicted - 1), {},
+                             [keep_switch](const Candidate& c) {
+                                 return std::tuple{!(keep_switch > 0 && c.unused), c.slow, c.last_use};
+                             });
+    std::vector<GraphicsPipelineCacheKey> evict_keys;
+    evict_keys.reserve(evicted);
+    for (const Candidate& c : std::span{candidates}.first(evicted)) {
+        evict_keys.push_back(*c.key);
+    }
     const u64 tick = scheduler.CurrentTick();
     size_t evicted_unused = 0;
-    for (size_t i = 0; i < evicted; ++i) {
-        const auto it = graphics_cache.find(candidates[i].second);
+    for (const GraphicsPipelineCacheKey& key : evict_keys) {
+        const auto it = graphics_cache.find(key);
         if (used_this_session.erase(it->second.get()) != 0) {
             used_and_evicted.insert(it->first.Hash());
         }
@@ -10271,7 +10313,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
     auto entry{CreatePrecompiledComputePipeline(key, env)};
     if (!entry.pipeline) {
         main_pools.ReleaseContents();
-        entry = CreateComputePipeline(main_pools, key, env, nullptr, true);
+        entry = CreateComputePipeline(main_pools, key, env, nullptr, true, false, nullptr,
+                                      keep_pointers.empty() && store);
     }
     if (const char* directory = std::getenv("EDEN_NX2_SHADER_DUMP");
         directory && !entry.pipeline && env.CanBeSerialized()) {
@@ -10297,7 +10340,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
 
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     ShaderPools& pools, const ComputePipelineCacheKey& key, Shader::Environment& env,
-    PipelineStatistics* statistics, bool build_in_parallel, bool warm, ComputeKeep* keep) try {
+    PipelineStatistics* statistics, bool build_in_parallel, bool warm, ComputeKeep* keep,
+    bool first_translation) try {
     auto hash = key.Hash();
     if (device.HasBrokenCompute()) {
         if (!warm) {
@@ -10388,12 +10432,20 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         pools.block.Free();
         pools.inst.Free();
     }
-    return {.pipeline = std::make_unique<ComputePipeline>(
-                device, scheduler, warm ? WarmPipelineCache() : PlayPipelineCache(),
-                descriptor_pool, guest_descriptor_queue,
-                descriptor_buffer_ring, thread_worker, statistics,
-                warm ? nullptr : &shader_notify, info,
-                std::move(spv_module), key.unique_hash),
+    auto pipeline = std::make_unique<ComputePipeline>(
+        device, scheduler, warm ? WarmPipelineCache() : PlayPipelineCache(), descriptor_pool,
+        guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
+        warm ? nullptr : &shader_notify, info, std::move(spv_module), key.unique_hash);
+    if (first_translation && !pipeline->IsBuilt() && ComputePipeline::FastFirstMode() == 3 &&
+        RaceColdOcarinaCompute(program_id != 0 ? program_id : visual_workaround_title,
+                               device.GetDriverID(), device.GetDeviceID(), key.unique_hash) &&
+        DontInlineComputeHelpers(code)) {
+        if (!cold_compute_worker) {
+            cold_compute_worker = std::make_unique<Common::ThreadWorker>(1, "VkColdCompute");
+        }
+        pipeline->RaceTemporaryBuild(*cold_compute_worker, std::move(code));
+    }
+    return {.pipeline = std::move(pipeline),
             .unbound_pointer_slots = env.IsNativeProgram()
                                          ? env.UnboundStoragePointerSlots()
                                          : std::vector<Shader::StoragePointerSlot>{},

@@ -8,6 +8,25 @@
 
 using namespace VideoCommon;
 
+TEST_CASE("RTX 2060 keeps costly OoT graphics prebuilds within the existing budget",
+          "[video_core][pipeline_cache]") {
+    // This worker build took 6,665 ms during a held OoT draw on the RTX 2060.
+    constexpr u64 slow = 0x720f4634f0ac74deULL;
+    CHECK(IsSlowOot2060GraphicsKey(slow));
+    CHECK_FALSE(IsSlowOot2060GraphicsKey(0));
+    std::array<u64, 3> keys{0, 1, slow};
+    auto evict = GraphicsPrebuildsOverBudget(std::span<u64>{keys}, 1, IsSlowOot2060GraphicsKey);
+    REQUIRE(evict.size() == 2);
+    CHECK(keys.front() == slow);
+    CHECK(GraphicsPrebuildsOverBudget(std::span<u64>{keys}, 0, IsSlowOot2060GraphicsKey).size() ==
+          keys.size());
+    CHECK(GraphicsPrebuildsOverBudget(std::span<u64>{keys}, keys.size(), IsSlowOot2060GraphicsKey)
+              .empty());
+    keys = {slow, 0x41802ca89a8918f4ULL, 1};
+    evict = GraphicsPrebuildsOverBudget(std::span<u64>{keys}, 1, IsSlowOot2060GraphicsKey);
+    CHECK(std::ranges::count_if(evict, IsSlowOot2060GraphicsKey) == 1);
+}
+
 TEST_CASE("Graphics pipelines are evicted only past the limit", "[video_core][pipeline_cache]") {
     SECTION("within the limit nothing is evicted, however stale") {
         CHECK(GraphicsPipelinesToEvict(0, 0, 100) == 0);

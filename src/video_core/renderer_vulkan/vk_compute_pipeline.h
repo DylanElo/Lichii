@@ -214,6 +214,8 @@ public:
     /// Starts the build on `worker` now, unless a thread claimed it already: the pipeline
     /// workers are first in, first out and may hold hundreds of builds before this one.
     void KickBuild(Common::ThreadWorker& worker);
+    /// Race the optimized worker with a temporary, equivalent compute module.
+    void RaceTemporaryBuild(Common::ThreadWorker& worker, std::vector<u32> words);
     /// When the build ended (steady clock); only once IsBuilt().
     [[nodiscard]] std::chrono::steady_clock::time_point BuiltAt() const noexcept {
         return std::chrono::steady_clock::time_point{
@@ -237,7 +239,7 @@ public:
 
     // --- FRITCHII_COMPUTE_FAST_FIRST ---
 
-    /// 0 off, 1 a dispatch that would wait for a first build gets an unoptimized build at once
+    /// 3 automatic for profiled cold builds, 0 off, 1 an unoptimized build on demand
     /// (the optimized one follows on its worker and is swapped in), 2 (test) every program built
     /// at run time takes that path, waited for or not. Live, any thread.
     [[nodiscard]] static int FastFirstMode();
@@ -255,7 +257,7 @@ private:
     bool RunFastBuild();
     [[nodiscard]] bool UsesFastFirst() const;
     /// The pipeline from the module; the caller holds the module (AcquireModule).
-    [[nodiscard]] vk::Pipeline CreateHandle(bool unoptimized);
+    [[nodiscard]] vk::Pipeline CreateHandle(bool unoptimized, VkShaderModule temporary = {});
     /// Makes the module when it is made late (precompiled), and holds it until ReleaseModule.
     /// False when there is none (it failed, or the optimized build released it).
     [[nodiscard]] bool AcquireModule();
@@ -301,6 +303,7 @@ private:
     std::atomic_bool build_task_done{true};
     std::condition_variable build_condvar;
     std::mutex build_mutex;
+    bool temporary_build_pending{}; ///< Under build_mutex, until the temporary worker returns.
     std::atomic_bool is_built{false};
     /// FRITCHII_ASYNC_COMPUTE_SKIP: the build's end (steady clock ticks), a kick queued, and
     /// Configure's pointer binds done ahead (BindStoragePointers).

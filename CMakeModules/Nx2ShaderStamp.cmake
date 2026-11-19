@@ -36,6 +36,9 @@ set(KnownStamps "143b6220486fb09b;3dc8b3ea00f9b392")
 # of the push constants (ConfigureImpl) and ConfigureAfterOcclPrepass: no create info changed.
 # So the prepared pipelines are 6.1's, with Full on or off.
 set(SameAsReleased "096d887be421a8e2=143b6220486fb09b;6f72127d45416a88=3dc8b3ea00f9b392")
+# The RTX 2060 temporary compute module is created only on a cold dispatch. Preparation,
+# boot builds and the optimized module stored for the next launch still use v6.2's SPIR-V.
+list(APPEND SameAsReleased "b991a1b78cf8ace2=143b6220486fb09b" "ebceb2df01424f05=3dc8b3ea00f9b392")
 
 # The SHA-256 of a file as if its FRITCHII_STAMP_SKIP blocks weren't there, line endings as in the
 # file. file(READ) gives LF line endings on every platform, so CRLF goes back on before hashing.

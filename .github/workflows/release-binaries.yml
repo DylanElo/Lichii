@@ -308,6 +308,7 @@ jobs:
           -DYUZU_USE_BUNDLED_QT=OFF
           -DYUZU_USE_BUNDLED_SDL3=ON
           -DENABLE_UPDATE_CHECKER=${{ matrix.fritchii && 'OFF' || 'ON' }}
+          -DENABLE_WERROR=${{ matrix.fritchii && 'OFF' || 'ON' }}
           -DLICHII_BUILD_TAG=${{ !matrix.fritchii && format('build-{0}', github.run_number) || '' }}
           -DLICHII_BUILD_PLATFORM=${{ matrix.platform }}
           -DUSE_DISCORD_PRESENCE=OFF

@@ -624,7 +624,8 @@ private:
                                                      Shader::Environment& env,
                                                      PipelineStatistics* statistics,
                                                      bool build_in_parallel, bool warm = false,
-                                                     ComputeKeep* keep = nullptr);
+                                                     ComputeKeep* keep = nullptr,
+                                                     bool first_translation = false);
 
     void SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                       const vk::PipelineCache& pipeline_cache, u32 cache_version);
@@ -848,6 +849,7 @@ private:
     std::atomic_bool save_again{};
 
     Common::ThreadWorker workers;
+    std::unique_ptr<Common::ThreadWorker> cold_compute_worker;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
 

@@ -23,6 +23,40 @@
 
 namespace Vulkan {
 
+bool DontInlineComputeHelpers(std::span<u32> words) {
+    if (words.size() < 5 || words.front() != spv::MagicNumber) {
+        return false;
+    }
+    u32 entry{};
+    bool changed = false;
+    for (size_t at = 5; at < words.size();) {
+        const size_t count = words[at] >> spv::WordCountShift;
+        if (!count || count > words.size() - at) {
+            return false;
+        }
+        const auto op = static_cast<spv::Op>(words[at] & spv::OpCodeMask);
+        if (op == spv::OpEntryPoint) {
+            if (entry || count < 4 || words[at + 1] != spv::ExecutionModelGLCompute) {
+                return false;
+            }
+            entry = words[at + 2];
+        } else if (op == spv::OpFunction) {
+            if (!entry || count != 5) {
+                return false;
+            }
+            if (words[at + 2] != entry) {
+                auto& control = words[at + 3];
+                const u32 replacement = (control & ~u32{spv::FunctionControlInlineMask}) |
+                                        u32{spv::FunctionControlDontInlineMask};
+                changed |= replacement != control;
+                control = replacement;
+            }
+        }
+        at += count;
+    }
+    return changed;
+}
+
 vk::ShaderModule BuildShader(const Device& device, std::span<const u32> code) {
     return device.GetLogical().CreateShaderModule({
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,

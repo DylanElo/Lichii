@@ -26,6 +26,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_binary.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/early_compute.h"
 #include "video_core/memstage_stats.h"
@@ -504,7 +505,7 @@ ComputePipeline::~ComputePipeline() {
     }
 }
 
-vk::Pipeline ComputePipeline::CreateHandle(bool unoptimized) {
+vk::Pipeline ComputePipeline::CreateHandle(bool unoptimized, VkShaderModule temporary) {
     const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
         .pNext = nullptr,
@@ -555,7 +556,7 @@ vk::Pipeline ComputePipeline::CreateHandle(bool unoptimized) {
                                VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT}
                          : VkPipelineShaderStageCreateFlags{},
             .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = *spv_module,
+            .module = temporary ? temporary : *spv_module,
             .pName = "main",
             .pSpecializationInfo = nullptr,
         },
@@ -563,7 +564,7 @@ vk::Pipeline ComputePipeline::CreateHandle(bool unoptimized) {
         .basePipelineHandle = 0,
         .basePipelineIndex = 0,
     };
-    if (unoptimized) {
+    if (unoptimized || temporary) {
         // FRITCHII_COMPUTE_FAST_FIRST: never stored. Not through the binary store or a pipeline
         // cache, which keep the optimized build of this program for the next session.
         return device.GetLogical().CreateComputePipeline(compute_ci);
@@ -607,7 +608,11 @@ bool ComputePipeline::Publish(vk::Pipeline made, bool optimized, double compile_
     bool after_fast = false;
     double served_fast_ms = 0.0;
     {
-        std::scoped_lock lock{build_mutex};
+        std::unique_lock lock{build_mutex};
+        if (optimized && !made_ok && temporary_build_pending) {
+            // The other driver call may still succeed. Publish a failure only after both failed.
+            build_condvar.wait(lock, [this] { return !temporary_build_pending || IsBuilt(); });
+        }
         if (!is_built.load(std::memory_order::relaxed)) {
             // Nothing binds `pipeline` before is_built: Configure's build wait precedes the bind.
             pipeline = std::move(made);
@@ -635,14 +640,14 @@ bool ComputePipeline::Publish(vk::Pipeline made, bool optimized, double compile_
         }
         // Otherwise `made` lost the race (an unoptimized build after the optimized one): it was
         // never bound, and is destroyed when this returns.
+        if (!optimized) {
+            NoteFastBuild(this, shader_hash, first, compile_ms, fast_open);
+        } else if (after_fast) {
+            NoteOptimizedAfterFast(this, shader_hash, made_ok, served_fast_ms, compile_ms, fast_open);
+        }
     }
     if (first && build_notify) {
         build_notify->MarkShaderComplete();
-    }
-    if (!optimized) {
-        NoteFastBuild(this, shader_hash, first, compile_ms, fast_open);
-    } else if (after_fast) {
-        NoteOptimizedAfterFast(this, shader_hash, made_ok, served_fast_ms, compile_ms, fast_open);
     }
     return first;
 }
@@ -670,12 +675,13 @@ void ComputePipeline::SwapInOptimized() {
 
 int ComputePipeline::FastFirstMode() {
     const int value = VideoCore::Nx2Debug::SwitchValue(
-        VideoCore::Nx2Debug::g_compute_fast_first, "FRITCHII_COMPUTE_FAST_FIRST", 0);
-    return value == 1 || value == 2 ? value : 0;
+        VideoCore::Nx2Debug::g_compute_fast_first, "FRITCHII_COMPUTE_FAST_FIRST", 3);
+    return value >= 1 && value <= 3 ? value : 0;
 }
 
 bool ComputePipeline::UsesFastFirst() const {
-    return fast_first_allowed && FastFirstMode() != 0;
+    const int mode = FastFirstMode();
+    return fast_first_allowed && (mode == 1 || mode == 2);
 }
 
 void ComputePipeline::RunBuild() {
@@ -695,7 +701,7 @@ void ComputePipeline::RunBuild() {
 }
 
 void ComputePipeline::RunNeededBuild() {
-    if (is_built.load(std::memory_order::acquire)) {
+    if (is_built.load(std::memory_order::acquire) || fast_claimed.load(std::memory_order_acquire)) {
         return;
     }
     if (UsesFastFirst()) {
@@ -741,6 +747,46 @@ bool ComputePipeline::WaitBuiltFor(std::chrono::nanoseconds timeout) {
     std::unique_lock lock{build_mutex};
     return build_condvar.wait_for(lock, timeout,
                                   [this] { return is_built.load(std::memory_order::relaxed); });
+}
+
+void ComputePipeline::RaceTemporaryBuild(Common::ThreadWorker& worker, std::vector<u32> words) {
+    // Before first dispatch: Configure waits for the first ready handle, without compiling
+    // synchronously on the scheduler while the other worker could finish.
+    {
+        std::scoped_lock lock{build_mutex};
+        if (IsBuilt()) {
+            return;
+        }
+        temporary_build_pending = true;
+    }
+    fast_claimed.store(true, std::memory_order_release);
+    kick_pending.store(true, std::memory_order_release);
+    worker.QueueWork([this, words = std::move(words)] {
+        // Give an already-cached optimized pipeline time to return before starting extra work.
+        if (!WaitBuiltFor(std::chrono::milliseconds{20})) {
+            const auto begin = std::chrono::steady_clock::now();
+            try {
+                auto module = BuildShader(device, words);
+                auto made = CreateHandle(false, *module);
+                const double ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - begin).count();
+                if (made) {
+                    const bool first = Publish(std::move(made), false, ms);
+                    LOG_INFO(Render_Vulkan, "RTX 2060 compute {:016x}: temporary DontInline build "
+                                            "{:.1f} ms, published first: {}", shader_hash, ms, first);
+                }
+            } catch (const vk::Exception& error) {
+                LOG_WARNING(Render_Vulkan, "RTX 2060 compute {:016x}: temporary build failed: {}",
+                            shader_hash, error.what());
+            }
+        }
+        {
+            std::scoped_lock lock{build_mutex};
+            temporary_build_pending = false;
+        }
+        build_condvar.notify_all();
+        kick_pending.store(false, std::memory_order_release);
+    });
 }
 
 void ComputePipeline::KickBuild(Common::ThreadWorker& worker) {
@@ -1210,7 +1256,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     // FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS: a pipeline that counts as unbuilt by the test delay
     // waits here as a building one does, until the delay ends.
     const auto test_deadline = std::exchange(test_wait_until, {});
-    if (!is_built.load(std::memory_order::relaxed) ||
+    if (!IsBuilt() ||
         test_deadline != std::chrono::steady_clock::time_point{}) {
         // Wait for the pipeline to be built
         scheduler.Record([this, test_deadline](vk::CommandBuffer) {

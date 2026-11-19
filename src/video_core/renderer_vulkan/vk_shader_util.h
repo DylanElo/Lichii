@@ -10,6 +10,9 @@
 
 namespace Vulkan {
 
+/// Changes only helper function controls in a single-entry compute module for a temporary build.
+[[nodiscard]] bool DontInlineComputeHelpers(std::span<u32> words);
+
 class Device;
 
 vk::ShaderModule BuildShader(const Device& device, std::span<const u32> code);
