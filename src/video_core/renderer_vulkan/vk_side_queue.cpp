@@ -123,8 +123,7 @@ u64 SideQueue::Submit(u64 main_tick_, std::span<const Copy> copies) {
     slot.value = value;
     ++next_value;
     next_slot = (next_slot + 1) % slots.size();
-    // Every main submission after `main_tick` waits for it until the side semaphore reports it
-    // (none up to it does: the copy waits for those).
+    // The first eligible main submission waits for the copy and covers later submissions.
     master.RequireSide(value, main_tick, value);
     return value;
 }

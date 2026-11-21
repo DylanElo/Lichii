@@ -147,6 +147,10 @@ public:
         return render_pass_has_stores;
     }
 
+    void NoteTransformFeedbackBegin() {
+        render_pass_used_transform_feedback = true;
+    }
+
     /// A dispatch was recorded: the next render pass must see what it wrote.
     void NoteComputeWrites() {
         compute_writes_pending = true;
@@ -510,6 +514,7 @@ private:
     std::unique_ptr<MasterSemaphore> master_semaphore;
     FragmentBarrierState fragment_barrier;
     bool render_pass_has_stores{};
+    bool render_pass_used_transform_feedback{};
     bool compute_writes_pending{};
     bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;

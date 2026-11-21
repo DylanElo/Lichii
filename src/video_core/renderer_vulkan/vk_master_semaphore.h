@@ -74,14 +74,11 @@ public:
     }
 
     /// FRITCHII_READ_SIDE_COPY >= 2 (vk_side_queue.h): the side queue's timeline semaphore
-    /// (null: none), and a side value that every main submission with a tick after
-    /// `after_tick` (the main tick the side copy itself waits for) waits for, stage
-    /// ALL_COMMANDS, until the side semaphore reports it. Submissions up to `after_tick` never
+    /// (null: none), and a side value the first eligible main submission waits for at
+    /// ALL_COMMANDS, covering later submissions. Submissions up to `after_tick` never
     /// wait for it: the side copy waits for them (a tick handed to the worker but not given to
     /// the queue yet would deadlock otherwise). Any thread.
-    void SetSideSemaphore(const vk::Semaphore* side) noexcept {
-        side_semaphore.store(side, std::memory_order_release);
-    }
+    void SetSideSemaphore(const vk::Semaphore* side) noexcept;
     /// `submitted`: the newest side value submitted (Submit calls this after its vkQueueSubmit).
     void RequireSide(u64 value, u64 after_tick, u64 submitted);
 
@@ -117,23 +114,24 @@ private:
 private:
     const Device& device;             ///< Device.
     vk::Semaphore semaphore;          ///< Timeline semaphore.
-    /// FRITCHII_READ_SIDE_COPY: the side value the next submissions wait for, and the newest
-    /// value the side semaphore reported (read on the worker at each submit).
-    std::atomic<const vk::Semaphore*> side_semaphore{nullptr};
+    /// FRITCHII_READ_SIDE_COPY: registrations for the current side timeline, under side_mutex.
+    const vk::Semaphore* side_semaphore{};
     struct SideWait {
         u64 value;
         u64 after_tick;
     };
     std::mutex side_mutex;
-    std::vector<SideWait> side_waits; ///< not reported done yet, oldest first
+    std::vector<SideWait> side_waits; ///< neither completed nor covered by a queued wait
     std::atomic<u64> side_pending{0}; ///< side_waits.size(), read without the lock
     u64 side_submitted{0};            ///< the newest side value submitted (`side_mutex`)
     std::atomic<u64> side_main_waits{0};
     std::atomic<u64> queue_submitted_tick{0};
     std::atomic<u64> side_unsubmitted{0};
-    u64 side_reported{0};
+    /// Remove only covered values, preserving registrations made during vkQueueSubmit.
+    void RetireSideWaits(u64 through); ///< side_mutex held
     /// The side value submission `host_tick` waits for (0: none); the worker's, per submit.
     [[nodiscard]] u64 SideWaitValue(u64 host_tick, VkSemaphore& side_handle);
+    VkResult FinishSideWait(VkResult result, VkSemaphore side_handle, u64 value);
     /// On their own cache lines: the GPU thread reads current_tick several times a draw, while
     /// threads refreshing gpu_tick would otherwise make each of those reads miss.
     alignas(64) std::atomic<u64> gpu_tick{0};     ///< Current known GPU tick.

@@ -188,6 +188,14 @@ void MasterSemaphore::Wait(u64 tick) {
     Refresh();
 }
 
+void MasterSemaphore::SetSideSemaphore(const vk::Semaphore* side) noexcept {
+    std::scoped_lock lock{side_mutex};
+    side_semaphore = side;
+    side_waits.clear();
+    side_submitted = 0;
+    side_pending.store(0, std::memory_order_release);
+}
+
 void MasterSemaphore::RequireSide(u64 value, u64 after_tick, u64 submitted) {
     std::scoped_lock lock{side_mutex};
     side_submitted = (std::max)(side_submitted, submitted);
@@ -195,18 +203,21 @@ void MasterSemaphore::RequireSide(u64 value, u64 after_tick, u64 submitted) {
     side_pending.store(side_waits.size(), std::memory_order_release);
 }
 
+void MasterSemaphore::RetireSideWaits(u64 through) {
+    std::erase_if(side_waits, [through](const SideWait& wait) { return wait.value <= through; });
+    side_pending.store(side_waits.size(), std::memory_order_release);
+}
+
 u64 MasterSemaphore::SideWaitValue(u64 host_tick, VkSemaphore& side_handle) {
     if (side_pending.load(std::memory_order_acquire) == 0) {
         return 0;
     }
-    const vk::Semaphore* const side = side_semaphore.load(std::memory_order_acquire);
-    if (side == nullptr) {
+    std::scoped_lock lock{side_mutex};
+    if (side_semaphore == nullptr) {
         return 0;
     }
-    side_reported = (std::max)(side_reported, side->GetCounter());
-    std::scoped_lock lock{side_mutex};
-    std::erase_if(side_waits, [this](const SideWait& wait) { return wait.value <= side_reported; });
-    side_pending.store(side_waits.size(), std::memory_order_release);
+    const u64 reported = side_semaphore->GetCounter();
+    RetireSideWaits(reported);
     u64 value = 0;
     for (const SideWait& wait : side_waits) {
         if (wait.after_tick < host_tick) {
@@ -220,13 +231,24 @@ u64 MasterSemaphore::SideWaitValue(u64 host_tick, VkSemaphore& side_handle) {
                   "FRITCHII_READ_SIDE_COPY: main tick {} would wait for side value {}, newest "
                   "submitted {}: wait dropped (must be 0)",
                   host_tick, value, side_submitted);
-        value = side_submitted > side_reported ? side_submitted : 0;
+        value = side_submitted > reported ? side_submitted : 0;
     }
     if (value != 0) {
-        side_handle = **side;
-        side_main_waits.fetch_add(1, std::memory_order_relaxed);
+        side_handle = **side_semaphore;
     }
     return value;
+}
+
+VkResult MasterSemaphore::FinishSideWait(VkResult result, VkSemaphore side_handle, u64 value) {
+    if (result == VK_SUCCESS && value != 0) {
+        // An ALL_COMMANDS wait covers this batch and all later commands on the graphics queue.
+        std::scoped_lock lock{side_mutex};
+        if (side_semaphore != nullptr && **side_semaphore == side_handle) {
+            RetireSideWaits(value);
+            side_main_waits.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return result;
 }
 
 VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
@@ -256,6 +278,8 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
                                               VkSemaphore wait_semaphore, u64 host_tick) {
     const VkSemaphore timeline_semaphore = *semaphore;
 
+    VkSemaphore side_handle = VK_NULL_HANDLE;
+    const u64 side_value = SideWaitValue(host_tick, side_handle);
     if (device.HasSynchronization2()) {
         const std::array<VkCommandBufferSubmitInfo, 2> cmdbuffer_infos{{
             {
@@ -296,9 +320,6 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
             num_signal_semaphores = 2;
         }
 
-        // FRITCHII_READ_SIDE_COPY: a side copy not reported done yet (RequireSide).
-        VkSemaphore side_handle = VK_NULL_HANDLE;
-        const u64 side_value = SideWaitValue(host_tick, side_handle);
         std::array<VkSemaphoreSubmitInfo, 2> wait_infos{};
         u32 num_wait_semaphores = 0;
         if (wait_semaphore) {
@@ -333,7 +354,8 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
             .signalSemaphoreInfoCount = num_signal_semaphores,
             .pSignalSemaphoreInfos = signal_infos.data(),
         };
-        return device.GetGraphicsQueue().Submit2(submit_info2);
+        return FinishSideWait(device.GetGraphicsQueue().Submit2(submit_info2), side_handle,
+                              side_value);
     }
 
     const u32 num_signal_semaphores = signal_semaphore ? 2 : 1;
@@ -342,9 +364,6 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
 
     const std::array cmdbuffers{*upload_cmdbuf, *cmdbuf};
 
-    // FRITCHII_READ_SIDE_COPY: a side copy not reported done yet (RequireSide).
-    VkSemaphore side_handle = VK_NULL_HANDLE;
-    const u64 side_value = SideWaitValue(host_tick, side_handle);
     std::array<VkSemaphore, 2> wait_sems{};
     std::array<VkPipelineStageFlags, 2> wait_masks{};
     std::array<u64, 2> wait_values{}; // 0 for the binary one
@@ -387,7 +406,7 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
         .pSignalSemaphores = p_signal_sems,
     };
 
-    return device.GetGraphicsQueue().Submit(submit_info);
+    return FinishSideWait(device.GetGraphicsQueue().Submit(submit_info), side_handle, side_value);
 }
 
 VkResult MasterSemaphore::SubmitQueueFence(vk::CommandBuffer& cmdbuf,

@@ -615,12 +615,13 @@ public:
                                           *buffers[resolve_buffer_index], num_slots_used,
                                           min_accumulation_limit, max_accumulation_limit);
 
-        } else {
+        } else if (accumulation_buffer_dirty) {
             scheduler.RequestOutsideRenderPassOperationContext();
             scheduler.Record([buffer = *accumulation_buffer](vk::CommandBuffer cmdbuf) {
                 cmdbuf.FillBuffer(buffer, 0, 8, 0);
             });
         }
+        accumulation_buffer_dirty = has_multi_queries;
 
         ReplicateCurrentQueryIfNeeded();
         std::function<void()> func([this] { amend_value = accumulation_value; });
@@ -1227,6 +1228,8 @@ private:
     size_t first_accumulation_checkpoint{};
     size_t last_accumulation_checkpoint{};
     bool accumulation_since_last_sync{};
+    // Only a prefix scan can change the zero initially written to this private GPU buffer.
+    bool accumulation_buffer_dirty{};
     VideoCommon::HostQueryBase* current_query;
     bool has_started{};
     std::mutex flush_guard;
@@ -1552,6 +1555,7 @@ private:
         has_flushed_end_pending = true;
         // Refresh buffers state before beginning transform feedback so counters are up-to-date
         UpdateBuffers();
+        scheduler.NoteTransformFeedbackBegin();
         if (!has_started || buffers_count == 0) {
             // No counter buffers available: begin without counters
             scheduler.Record([](vk::CommandBuffer cmdbuf) {

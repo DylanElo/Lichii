@@ -7074,9 +7074,9 @@ saving. "Read side copy" line every 600 frames.
 2 (verify) and 3 (on) need the value at boot: the device is then made with a second queue of the
 graphics family (Device::WantsSideQueue; a family of one queue logs it and counts dry). An
 eligible download's copy is recorded on that queue (vk_side_queue.h), after the master timeline
-reached the writer's tick, with a host-read barrier, signalling its own timeline value; every main
-submission with a tick after the writer's waits for that value until the side semaphore reports
-it (MasterSemaphore::RequireSide: never one up to the writer's, which the copy itself waits for).
+reached the writer's tick, with a host-read barrier, signalling its own timeline value. The first
+eligible main submission after the writer waits at ALL_COMMANDS if the copy is still pending.
+This also orders later commands on that queue (MasterSemaphore::RequireSide).
 The download's main tick (its SubmitForHostRead) is such a submission, so a landing that waited
 for it finds the side copy done too. Two rules keep the queues from waiting on each other (build
 26 hung without the first, helper_cu_answer.md Round 4): the main ticks the side submissions wait

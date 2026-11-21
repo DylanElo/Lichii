@@ -27,8 +27,8 @@ class MasterSemaphore;
 ///     batch's writes available, the wait makes them visible to the waiting stage);
 ///   - nothing submitted to the main queue after `main_tick` writes the copied bytes before the
 ///     copy reads them: the newest write over them is in `main_tick` (the read's caller checks),
-///     and every main submission from the next one on waits for the side value
-///     (MasterSemaphore::RequireSide) until the side semaphore reports it;
+///     and the first eligible main submission waits for the side value at ALL_COMMANDS.
+///     That wait covers later commands on the same queue (MasterSemaphore::RequireSide);
 ///   - the copy ends with a TRANSFER_WRITE -> HOST_READ barrier, the reader waits on the side
 ///     semaphore before it reads the staging memory;
 ///   - the main ticks the side submissions wait for never go down (each waits for the highest
