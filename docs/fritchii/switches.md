@@ -1844,8 +1844,8 @@ texture-cache lock, downloads, memory queries, collection, and deferred destruct
 
 Set to 1 at startup to let the GPU command front end sleep when it has waited at least 3 ms
 for a ring position. The engine and render threads wake it when the original completion
-condition is satisfied. Short waits retain their spin and yield behavior. The personal Windows
-RTX 2060 package enables this option. Set it to 0 to compare the original behavior.
+condition is satisfied. Short waits retain their spin and yield behavior. This experiment is
+off by default. The first RTX 2060 Castle Town walk with it enabled had more long frames.
 An explicit `EDEN_NX2_PERF_ON=front_sleep` selects the existing general sleep mode.
 
 ### FRITCHII_KAKARIKO_FRAGMENT
