@@ -27,6 +27,41 @@ TEST_CASE("RTX 2060 keeps costly OoT graphics prebuilds within the existing budg
     CHECK(std::ranges::count_if(evict, IsSlowOot2060GraphicsKey) == 1);
 }
 
+TEST_CASE("RTX 2060 boot reserves slots for costly and recently used states",
+          "[video_core][pipeline_cache]") {
+    // Visit old records first and costly records last to exercise selection across file order.
+    const auto select = [](std::array<size_t, 4> counts, size_t limit, size_t fallback = 3000) {
+        constexpr std::array<u8, 4> ages{4, 1, 0, 3};
+        RecentGraphicsBootBudget budget;
+        for (size_t group = 0; group < counts.size(); ++group) {
+            for (size_t i = 0; i < counts[group]; ++i) {
+                budget.Count(group == 3, ages[group]);
+            }
+        }
+        budget.SetLimit(limit, fallback);
+        std::array<size_t, 4> taken{};
+        for (size_t group = 0; group < counts.size(); ++group) {
+            for (size_t i = 0; i < counts[group]; ++i) {
+                taken[group] += budget.Take(group == 3, ages[group]);
+            }
+        }
+        return taken;
+    };
+    // Frozen benchmark cache and the player's larger recent history on the same 16 GiB host.
+    CHECK((select({7404, 508, 975, 17}, 1751) == std::array<size_t, 4>{0, 508, 975, 17}));
+    CHECK((select({2454, 3488, 2934, 18}, 1751) == std::array<size_t, 4>{0, 0, 1733, 18}));
+    CHECK((select({40, 0, 0, 2}, 16, 10) == std::array<size_t, 4>{8, 0, 0, 2}));
+    CHECK((select({40, 0, 0, 2}, 1) == std::array<size_t, 4>{0, 0, 0, 1}));
+    CHECK((select({40, 1, 1, 2}, 0) == std::array<size_t, 4>{}));
+
+    RecentGraphicsBootBudget only_slow_recent;
+    only_slow_recent.Count(false, 5);
+    only_slow_recent.Count(true, 0);
+    only_slow_recent.SetLimit(10, 3000);
+    CHECK_FALSE(only_slow_recent.Take(false, 5));
+    CHECK(only_slow_recent.Take(true, 0));
+}
+
 TEST_CASE("Graphics pipelines are evicted only past the limit", "[video_core][pipeline_cache]") {
     SECTION("within the limit nothing is evicted, however stale") {
         CHECK(GraphicsPipelinesToEvict(0, 0, 100) == 0);

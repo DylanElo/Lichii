@@ -38,6 +38,48 @@ constexpr bool IsSlowOot2060GraphicsKey(u64 hash) {
     return std::ranges::binary_search(slow, hash);
 }
 
+// Count the available records first, then spend the budget on costly states and the youngest
+// sessions. Taking records in file order makes ties deterministic without sorting disk records.
+class RecentGraphicsBootBudget {
+public:
+    static constexpr u8 RecentSessions = 2;
+
+    void Count(bool slow, u8 age) {
+        ++slots[Rank(slow, age)];
+        has_recent |= age < RecentSessions;
+    }
+
+    void SetLimit(size_t limit, size_t no_history_limit) {
+        // With no recent matching record, fill spare slots in cache order on the first boot.
+        if (has_recent) {
+            slots.back() = 0;
+        } else {
+            limit = (std::min)(limit, no_history_limit);
+        }
+        for (auto& count : slots) {
+            count = (std::min)(count, limit);
+            limit -= count;
+        }
+    }
+
+    bool Take(bool slow, u8 age) {
+        auto& remaining = slots[Rank(slow, age)];
+        if (remaining == 0) {
+            return false;
+        }
+        --remaining;
+        return true;
+    }
+
+private:
+    static constexpr size_t Rank(bool slow, u8 age) {
+        return slow ? 0 : 1U + (std::min)(age, RecentSessions);
+    }
+
+    std::array<size_t, RecentSessions + 2> slots{};
+    bool has_recent{};
+};
+
 // Fill existing retention slots with expensive prebuilds first. The remainder may be evicted.
 template <typename T, typename Predicate>
 constexpr std::span<T> GraphicsPrebuildsOverBudget(std::span<T> prebuilt, size_t keep,
