@@ -1679,6 +1679,7 @@ void MergeCompatiblePipelineCaches(const std::filesystem::path& base_dir,
 // memory built before the game started; the list is only saved at exit or after two minutes, so a
 // boot that ran out of memory never saved one and the next boot did the same.
 constexpr size_t MaxPipelinesWithoutUsedList = 3000;
+constexpr u64 ShortRam = u64{24} << 30;
 
 // EDEN_NX2_BACKGROUND_PIPELINES=0: cached pipelines boot skips are built when first needed, on
 // the GPU thread, as before. EDEN_NX2_BACKGROUND_PIPELINE_THREADS sets how many threads build
@@ -1719,7 +1720,6 @@ size_t EvictAbovePipelines() {
         // Only where RAM is short: an evicted pipeline is rebuilt on the GPU thread when its area
         // comes back (a run that evicted 3,400 in 25 minutes paid 14 s of stalls), so 24 GB and
         // more keep the old 8,000; under that, paging costs more than those rebuilds.
-        constexpr u64 ShortRam = u64{24} << 30;
         const size_t chosen =
             ram >= ShortRam ? MaxPipelines : std::clamp<size_t>(by_ram, MinPipelines, MaxPipelines);
         LOG_INFO(Render_Vulkan,
@@ -4930,15 +4930,32 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             callback(VideoCore::LoadCallbackStage::Build, state.built, state.total);
         }
     }};
+    VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
+                               load_graphics);
+    // The disk loader has migrated usage ages to this driver's keys. Keep the full history for
+    // future sessions and background preparation, but avoid building it all before the first draw.
     const bool prefer_slow_graphics = PreferSlowOot2060Graphics(device, title_id);
+    const u64 host_ram = prefer_slow_graphics ? Common::GetMemInfo().TotalPhysicalMemory : 0;
+    const bool recent_boot_only = host_ram > 0 && host_ram < ShortRam && !PreloadAllPipelines() &&
+                                  used_pipelines.size() > EvictAbovePipelines();
+    const auto used_at_boot = [&](u64 hash) {
+        const auto used = used_pipelines.find(hash);
+        return used != used_pipelines.end() &&
+               (!recent_boot_only || used->second < UsedPipelinesMaxAge);
+    };
+    const bool no_boot_history =
+        used_pipelines.empty() ||
+        (recent_boot_only && std::ranges::none_of(graphics_records, [&](const auto& record) {
+             return used_at_boot(record.first.Hash());
+         }));
     size_t slow_graphics_records = 0;
     const auto queue_graphics{[&](const GraphicsPipelineCacheKey& key, DiskRecords records) {
         const u64 hash = key.Hash();
         disk_pipelines.insert(hash);
         const bool slow = prefer_slow_graphics && VideoCommon::IsSlowOot2060GraphicsKey(hash);
         slow_graphics_records += slow;
-        const bool skip = used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
-                                                 : !used_pipelines.contains(hash) && !slow;
+        const bool skip = no_boot_history ? queued_graphics >= MaxPipelinesWithoutUsedList
+                                          : !used_at_boot(hash) && !slow;
         if (!PreloadAllPipelines() && skip) {
             ++skipped_pipelines;
             if (BackgroundPipelinesEnabled()) {
@@ -4966,15 +4983,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
         ++state.total;
     }};
-    VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
-                               load_graphics);
     if (streaming) {
         // Read again by one thread, a few builds ahead of the boot workers.
         boot_stream = std::make_shared<RecordStream>(record_file, 2 * num_pipeline_workers + 8,
                                                      false);
     }
     const auto queue_all_graphics = [&] {
-        if (prefer_slow_graphics && used_pipelines.empty() && !PreloadAllPipelines() &&
+        if (prefer_slow_graphics && no_boot_history && !PreloadAllPipelines() &&
             graphics_records.size() > MaxPipelinesWithoutUsedList) {
             std::ranges::stable_partition(graphics_records, [](const auto& record) {
                 return VideoCommon::IsSlowOot2060GraphicsKey(record.first.Hash());
@@ -5015,6 +5030,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+    if (recent_boot_only) {
+        LOG_INFO(Render_Vulkan,
+                 "RTX 2060 graphics warmup: {} queued from {} records, {} usage keys retained, {}",
+                 queued_graphics, queued_graphics + skipped_pipelines, used_pipelines.size(),
+                 no_boot_history ? "no recent matching keys" : "two recent sessions and slow states");
+    }
     if (foreign_records != 0) {
         LOG_INFO(Render_Vulkan,
                  "{} cached graphics pipeline records were stored by another GPU driver{}",
