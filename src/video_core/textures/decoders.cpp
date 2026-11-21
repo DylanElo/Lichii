@@ -80,29 +80,32 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
     if constexpr (BYTES_PER_PIXEL == 16 && origin_x == 0 && origin_y == 0 && origin_z == 0) {
         // 16-byte units (UnswizzleTexture and SwizzleTexture widen to them when a row allows it):
         // their offsets in a GOB come from a table instead of being computed one by one.
-        if constexpr (!TO_LINEAR) {
-            // A full native GOB contributes one 64-byte run to each of eight output rows.
-            // Consume its 512 input bytes together while retaining the guest row stride.
-            if (native_tiling && depth == 1 && block_depth == 0 && width % 4 == 0 &&
-                height % GOB_SIZE_Y == 0 && u64{pitch} * height >= 256 * 1024) {
-                constexpr auto offsets = GobUnitOffsets(true);
-                for (u32 line = 0; line < height; line += GOB_SIZE_Y) {
-                    const u32 block_y = line >> GOB_SIZE_Y_SHIFT;
-                    const u32 offset_y = (block_y >> block_height) * block_size +
-                                         ((block_y & block_height_mask) << GOB_SIZE_SHIFT);
-                    for (u32 gob_x = 0; gob_x < width / 4; ++gob_x) {
-                        const u8* src = input.data() + offset_y + (gob_x << x_shift);
-                        u8* dst = output.data() + size_t{line} * pitch + gob_x * GOB_SIZE_X;
-                        for (u32 row = 0; row < GOB_SIZE_Y; ++row) {
-                            for (u32 unit = 0; unit < 4; ++unit) {
-                                std::memcpy(dst + size_t{row} * pitch + unit * 16,
-                                            src + offsets[row * 4 + unit], 16);
+        // A full native GOB contributes 64 bytes to each of eight linear rows.
+        // Finish one tiled block at a time in either direction.
+        if (native_tiling && depth == 1 && block_depth == 0 && width % 4 == 0 &&
+            height % GOB_SIZE_Y == 0 && u64{pitch} * height >= 256 * 1024) {
+            constexpr auto offsets = GobUnitOffsets(true);
+            for (u32 line = 0; line < height; line += GOB_SIZE_Y) {
+                const u32 block_y = line >> GOB_SIZE_Y_SHIFT;
+                const u32 offset_y = (block_y >> block_height) * block_size +
+                                     ((block_y & block_height_mask) << GOB_SIZE_SHIFT);
+                for (u32 gob_x = 0; gob_x < width / 4; ++gob_x) {
+                    const size_t linear_base = size_t{line} * pitch + gob_x * GOB_SIZE_X;
+                    const size_t tiled_base = size_t{offset_y} + (gob_x << x_shift);
+                    for (u32 row = 0; row < GOB_SIZE_Y; ++row) {
+                        for (u32 unit = 0; unit < 4; ++unit) {
+                            const size_t linear = linear_base + size_t{row} * pitch + unit * 16;
+                            const size_t tiled = tiled_base + offsets[row * 4 + unit];
+                            if constexpr (TO_LINEAR) {
+                                std::memcpy(output.data() + tiled, input.data() + linear, 16);
+                            } else {
+                                std::memcpy(output.data() + linear, input.data() + tiled, 16);
                             }
                         }
                     }
                 }
-                return;
             }
+            return;
         }
         const auto unit_offsets = GobUnitOffsets(native_tiling);
         const u32 gobs_wide = Common::DivCeil(width, 4U);
