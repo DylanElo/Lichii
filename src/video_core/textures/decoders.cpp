@@ -44,7 +44,7 @@ void incrpdep(u32& value) {
 // Where each 16-byte unit of a GOB row lies within the GOB, by row (y & 7) and unit (x / 16 & 3).
 // The 16 bytes of a unit are contiguous. A GOB's own offset is a multiple of GOB_SIZE, so the
 // native tiling's swap of bits 5 and 6 only moves units within it.
-std::array<u32, GOB_SIZE_Y * 4> GobUnitOffsets(bool native_tiling) {
+constexpr std::array<u32, GOB_SIZE_Y * 4> GobUnitOffsets(bool native_tiling) {
     std::array<u32, GOB_SIZE_Y * 4> offsets;
     for (u32 row = 0; row < GOB_SIZE_Y; ++row) {
         for (u32 unit = 0; unit < 4; ++unit) {
@@ -80,6 +80,30 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
     if constexpr (BYTES_PER_PIXEL == 16 && origin_x == 0 && origin_y == 0 && origin_z == 0) {
         // 16-byte units (UnswizzleTexture and SwizzleTexture widen to them when a row allows it):
         // their offsets in a GOB come from a table instead of being computed one by one.
+        if constexpr (!TO_LINEAR) {
+            // A full native GOB contributes one 64-byte run to each of eight output rows.
+            // Consume its 512 input bytes together while retaining the guest row stride.
+            if (native_tiling && depth == 1 && block_depth == 0 && width % 4 == 0 &&
+                height % GOB_SIZE_Y == 0 && u64{pitch} * height >= 256 * 1024) {
+                constexpr auto offsets = GobUnitOffsets(true);
+                for (u32 line = 0; line < height; line += GOB_SIZE_Y) {
+                    const u32 block_y = line >> GOB_SIZE_Y_SHIFT;
+                    const u32 offset_y = (block_y >> block_height) * block_size +
+                                         ((block_y & block_height_mask) << GOB_SIZE_SHIFT);
+                    for (u32 gob_x = 0; gob_x < width / 4; ++gob_x) {
+                        const u8* src = input.data() + offset_y + (gob_x << x_shift);
+                        u8* dst = output.data() + size_t{line} * pitch + gob_x * GOB_SIZE_X;
+                        for (u32 row = 0; row < GOB_SIZE_Y; ++row) {
+                            for (u32 unit = 0; unit < 4; ++unit) {
+                                std::memcpy(dst + size_t{row} * pitch + unit * 16,
+                                            src + offsets[row * 4 + unit], 16);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+        }
         const auto unit_offsets = GobUnitOffsets(native_tiling);
         const u32 gobs_wide = Common::DivCeil(width, 4U);
         for (u32 slice = 0; slice < depth; ++slice) {

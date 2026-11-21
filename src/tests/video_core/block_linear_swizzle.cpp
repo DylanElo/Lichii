@@ -210,6 +210,11 @@ TEST_CASE("Block linear swizzle matches the GOB layout", "[block_linear_swizzle]
             }
         }
     }
+    // Large native 2D uploads, including a complete GOB grid with padding in its stride
+    // and grids whose final row or column is partial.
+    CheckLayout({304, 224, 1, 4, 4, 0, 6}, true);
+    CheckLayout({300, 224, 1, 4, 4, 0, 6}, true);
+    CheckLayout({304, 225, 1, 4, 4, 0, 6}, true);
     // A row stride aligned past the width.
     for (const u32 alignment : {1U, 4U, 6U}) {
         for (const bool native : {false, true}) {
