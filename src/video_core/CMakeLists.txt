@@ -610,6 +610,13 @@ if (ENABLE_NSIGHT_AFTERMATH)
     target_include_directories(video_core PRIVATE "$ENV{NSIGHT_AFTERMATH_SDK}/include")
 endif()
 
+cmake_dependent_option(FRITCHII_RENDER_THINLTO "Optimize the Windows renderer with Clang ThinLTO"
+                       OFF "CXX_CLANG_CL" OFF)
+if (FRITCHII_RENDER_THINLTO)
+    target_compile_options(video_core PRIVATE
+        "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:/clang:-O3;-flto=thin>")
+endif()
+
 if (MSVC)
     target_compile_options(video_core PRIVATE
         /we4242 # 'identifier': conversion from 'type1' to 'type2', possible loss of data
