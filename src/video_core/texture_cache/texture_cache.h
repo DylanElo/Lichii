@@ -5225,14 +5225,17 @@ bool TextureCache<P>::TryZeroUpload(Image& image) {
             return false;
         }
         const u64 start = Common::Nx2Hitch::NowNs();
-        // The bytes the upload would read (GpuGuestMemory, unmapped pages as zeros), in pieces so
-        // a range that is not contiguous copies at most one piece.
+        // A fragmented guest range is copied into scratch before it can be inspected. Probe
+        // the first page separately so early data avoids a multi-MiB copy. A zero result still
+        // checks every byte, with later pieces ending at the usual 4 MiB boundaries.
         constexpr size_t Piece = 4_MiB;
+        constexpr size_t FirstPage = 4_KiB;
         const size_t total = image.guest_size_bytes;
         size_t looked = 0;
         bool zero = true;
-        for (size_t offset = 0; offset < total; offset += Piece) {
-            const size_t size = (std::min)(Piece, total - offset);
+        for (size_t offset = 0; offset < total;) {
+            const size_t limit = offset == 0 ? FirstPage : Piece - offset % Piece;
+            const size_t size = (std::min)(limit, total - offset);
             Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> bytes(
                 *gpu_memory, image.gpu_addr + offset, size, &swizzle_data_buffer);
             const size_t prefix = ZeroPrefixBytes(std::span<const u8>(bytes.data(), size));
@@ -5241,6 +5244,7 @@ bool TextureCache<P>::TryZeroUpload(Image& image) {
                 zero = false;
                 break;
             }
+            offset += size;
         }
         const u64 ns = Common::Nx2Hitch::NowNs() - start;
         Common::Nx2Hitch::Add(Common::Nx2Hitch::Cause::ZeroUpload, ns, looked);
