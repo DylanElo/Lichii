@@ -9794,12 +9794,23 @@ public:
     void Begin() {
         mark = Now();
         begin = mark;
+        texture_phases.clear();
     }
 
     void End(Part part) {
         const u64 now = Now();
-        ns[part] += now - mark;
+        frame_ns[part] = now - mark;
+        ns[part] += frame_ns[part];
+        if (part == Staging) {
+            texture_mark = now;
+        }
         mark = now;
+    }
+
+    void TexturePhase(const char* name) {
+        const u64 now = Now();
+        texture_phases.emplace_back(name, now - texture_mark);
+        texture_mark = now;
     }
 
     void Finish(bool on_render_thread) {
@@ -9807,7 +9818,14 @@ public:
         ++calls;
         calls_on_r += on_render_thread ? 1 : 0;
         total_ns += total;
-        longest_ns = (std::max)(longest_ns, total);
+        if (total > longest_ns) {
+            longest_ns = total;
+            if (total >= DetailThresholdNs) {
+                worst_end = mark;
+                worst_frame_ns = frame_ns;
+                worst_texture_phases = texture_phases;
+            }
+        }
         if (window_start == 0) {
             window_start = mark;
             return;
@@ -9833,6 +9851,23 @@ public:
                  static_cast<double>(total_ns) / 1e6 / seconds,
                  calls != 0 ? static_cast<double>(total_ns) / 1e3 / calls : 0.0,
                  static_cast<double>(longest_ns) / 1e3, parts);
+        if (longest_ns >= DetailThresholdNs) {
+            std::string frame_parts;
+            std::string texture_parts;
+            for (size_t i = 0; i < Count; ++i) {
+                frame_parts += fmt::format("{}{} {:.3f}", i == 0 ? "" : ", ", names[i],
+                                           static_cast<double>(worst_frame_ns[i]) / 1e6);
+            }
+            for (const auto& [name, elapsed] : worst_texture_phases) {
+                texture_parts += fmt::format("{}{} {:.3f}", texture_parts.empty() ? "" : ", ",
+                                             name, static_cast<double>(elapsed) / 1e6);
+            }
+            const double seconds_ago = static_cast<double>(Now() - worst_end) / 1e9;
+            LOG_INFO(Render_Vulkan,
+                     "Slowest frame end {:.3f} ms, ended {:.6f} s before this line; parts (ms): {}; "
+                     "inside texture part (ms): {}",
+                     static_cast<double>(longest_ns) / 1e6, seconds_ago, frame_parts, texture_parts);
+        }
         ns = {};
         calls = calls_on_r = total_ns = longest_ns = 0;
         window_start = mark;
@@ -9845,6 +9880,15 @@ private:
                                     .count());
     }
 
+    // One detailed call per reporting interval. With timing disabled the cache never reads the
+    // clock or records a phase. Phase names are static literals, and storage is reused each frame.
+    static constexpr u64 DetailThresholdNs = 20'000'000;
+    std::array<u64, Count> frame_ns{};
+    std::array<u64, Count> worst_frame_ns{};
+    std::vector<std::pair<const char*, u64>> texture_phases;
+    std::vector<std::pair<const char*, u64>> worst_texture_phases;
+    u64 texture_mark{};
+    u64 worst_end{};
     std::array<u64, Count> ns{};
     u64 mark{};
     u64 begin{};
@@ -10040,7 +10084,12 @@ void RasterizerVulkan::TickFrame() {
     part_done(FrameEndTimes::Staging);
     {
         std::scoped_lock lock{texture_cache.mutex};
-        texture_cache.TickFrame();
+        if (frame_end_times) [[unlikely]] {
+            g_frame_end_times.TexturePhase("cache lock");
+            texture_cache.TickFrame([](const char* name) { g_frame_end_times.TexturePhase(name); });
+        } else {
+            texture_cache.TickFrame();
+        }
     }
     part_done(FrameEndTimes::Textures);
     // SEAM (EXP123) is read here, once a frame, with nothing pending.

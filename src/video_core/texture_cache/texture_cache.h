@@ -1764,7 +1764,12 @@ void TextureCache<P>::LogVramOwners() {
 }
 
 template <class P>
-void TextureCache<P>::TickFrame() {
+void TextureCache<P>::TickFrame(void (*record_phase)(const char*)) {
+    const auto phase = [record_phase](const char* name) {
+        if (record_phase != nullptr) [[unlikely]] {
+            record_phase(name);
+        }
+    };
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
@@ -1789,9 +1794,11 @@ void TextureCache<P>::TickFrame() {
         }
     }
     // EXP121: before the usage is read below, so landed images leave the queued bytes.
+    phase("scratch and reports");
     if (!collect_downloads.empty()) {
         LandCollectDownloads();
     }
+    phase("land downloads");
     if constexpr (HAS_DEVICE_MEMORY_INFO) {
         // Switch 2 titles (native tiling) stream far more texture data than the original thresholds
         // were tuned for: title 1's attract loop alone keeps ~5.3 GB resident, so the collector
@@ -1937,6 +1944,7 @@ void TextureCache<P>::TickFrame() {
             }
         }
     }
+    phase("thresholds");
     if constexpr (requires { runtime.CurrentTick(); }) {
         while (!gpu_sentenced_images.empty() &&
                runtime.IsFree(gpu_sentenced_images.front().tick)) {
@@ -1978,6 +1986,7 @@ void TextureCache<P>::TickFrame() {
             runtime.SubmitImageFrees();
         }
     }
+    phase("retire completed images");
     // If we can obtain the memory info, use it instead of the estimate.
     if (runtime.CanReportMemoryUsage()) {
         total_used_memory = runtime.GetDeviceMemoryUsage();
@@ -2002,9 +2011,11 @@ void TextureCache<P>::TickFrame() {
             total_used_memory -= (std::min)(total_used_memory, runtime.PooledImageBytes());
         }
     }
+    phase("device usage");
     // FRITCHII_VRAM_BUDGET_MODE / FRITCHII_VRAM_OWNERS: once a second / every 10 s, with the
     // usage just read (the collector below already sees a moved cap).
     BudgetControl();
+    phase("budget control");
     LogVramOwners();
     // EDEN_NX2_MEM_TRACE=1 (ported): every 2 s, what the cache holds next to
     // what the process and the driver report (memory climbs).
@@ -2168,10 +2179,14 @@ void TextureCache<P>::TickFrame() {
         }
         unmap_stats = {};
     }
+    phase("reports");
     SweepUnmapped();
     SweepSuperseded();
+    phase("unmapped and superseded sweeps");
     SweepColdImages();
+    phase("cold sweep");
     TickThrashGuard();
+    phase("thrash guard");
     // An image that could not be made at all: the driver is out of memory whatever the counts
     // say, so collect as at the critical threshold.
     bool out_of_memory = false;
@@ -2193,13 +2208,16 @@ void TextureCache<P>::TickFrame() {
         // Texture memos of their null views would skip that read (EXP32).
         ++texture_memo_epoch;
     }
+    phase("garbage collection");
     sentenced_images.Tick();
     sentenced_image_index = (sentenced_image_index + 1) % TICKS_TO_DESTROY;
     sentenced_image_bytes[sentenced_image_index] = 0;
     sentenced_framebuffers.Tick();
     sentenced_image_view.Tick();
+    phase("delayed destruction");
     TickAsyncDecode();
     TickAsyncUnswizzle();
+    phase("async textures");
     if (frame_tick % 600 == 0 && !uploaded_ranges.empty()) {
         // EDEN_NX2_EXP8 bit 8: none. An image created again over cold memory (re-created after
         // eviction, or a render target at a new size) faults all of it back in while uploading.
@@ -2211,7 +2229,9 @@ void TextureCache<P>::TickFrame() {
         uploaded_ranges.clear();
     }
 
+    phase("uploaded range hints");
     runtime.TickFrame();
+    phase("Vulkan/runtime pools and scratch");
     ++frame_tick;
     if (const int lru_switch = VideoCore::Nx2Debug::Experiment(90); lru_switch != 0) {
         const auto now = std::chrono::steady_clock::now();
@@ -2335,6 +2355,7 @@ void TextureCache<P>::TickFrame() {
         }
         async_buffers_death_ring.clear();
     }
+    phase("frame counters and deferred buffers");
 }
 
 /// EDEN_NX2_TC_COLD_FRAMES (the cold sweep's K, 0 = off).

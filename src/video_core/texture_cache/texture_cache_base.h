@@ -318,7 +318,7 @@ public:
     explicit TextureCache(Runtime&, Tegra::MaxwellDeviceMemoryManager&);
 
     /// Notify the cache that a new frame has been queued
-    void TickFrame();
+    void TickFrame(void (*record_phase)(const char*) = nullptr);
 
     /// Return a constant reference to the given image view id
     [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
