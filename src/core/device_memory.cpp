@@ -37,7 +37,10 @@ DeviceMemory::DeviceMemory()
 #ifdef _WIN32
     // EDEN_NX2_ZERO_TRIM=0: no zero-page passes (A/B: their trims make the game fault the pages
     // back in when it reuses them, ~180k faults in an area load, 2026-11-10).
-    if (const char* value = std::getenv("EDEN_NX2_ZERO_TRIM"); value == nullptr || value[0] != '0') {
+    // Clean file-backed pages can already be discarded by Windows. Reading every resident page
+    // to find zeroes competes with guest map/protect calls during loads. An explicit 1 opts in.
+    if (const char* value = std::getenv("EDEN_NX2_ZERO_TRIM");
+        value ? value[0] != '0' : !buffer.UsesFileBacking()) {
         zero_trim_thread = std::jthread{[this](std::stop_token stop) { TrimZeroPages(stop); }};
     }
     if (const char* value = std::getenv("EDEN_NX2_MEM_OWNERS"); value == nullptr || value[0] != '0') {

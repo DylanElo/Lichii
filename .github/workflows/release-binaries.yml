@@ -491,10 +491,19 @@ jobs:
           }
           windeployqt --release --no-translations build/release/bin/fritchii.exe
 
-      - name: Include personal build licenses
+      - name: Package personal Windows settings and licenses
         if: matrix.fritchii
         shell: pwsh
-        run: Copy-Item -LiteralPath LICENSE.txt,LICENSES/Fritchii-Additional-Terms.txt -Destination build/release/bin/
+        run: |
+          Copy-Item -LiteralPath LICENSE.txt,LICENSES/Fritchii-Additional-Terms.txt -Destination build/release/bin/
+          $switches = 'build/release/bin/nx2_switches.txt'
+          if (-not (Test-Path -LiteralPath $switches -PathType Leaf)) { throw 'Missing Windows runtime switches' }
+          Add-Content -LiteralPath $switches -Encoding utf8NoBOM -Value @(
+            ''
+            '# Use a temporary file for guest RAM on this 16 GB Windows PC.'
+            'FRITCHII_FILE_BACKED_GUEST=1'
+            'FRITCHII_PROTECT_UNLOCKED=1'
+          )
 
       # A dynamic MinGW build is not portable on its own: windeployqt6 brings the Qt libraries and
       # plugins, then every non-system DLL the binaries and those plugins pull in gets copied next to

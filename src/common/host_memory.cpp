@@ -8,13 +8,17 @@
 
 #ifdef _WIN32
 
+#include <filesystem>
 #include <iterator>
+#include <shared_mutex>
 #include "common/container/unordered_map.h"
 #include <boost/icl/separate_interval_set.hpp>
 #include <windows.h>
+#include <sddl.h>
 #include <psapi.h>
 #include <vector>
 #include "common/dynamic_library.h"
+#include "common/scope_exit.h"
 
 #else // ^^^ Windows ^^^ vvv POSIX vvv
 
@@ -184,6 +188,83 @@ bool ReserveGuestMemory() {
     return value == nullptr || value[0] != '0';
 }
 
+// A shared data-file section keeps the same fastmem aliases while NTFS supplies its backing
+// store. Preallocate the whole guest size so later faults cannot run out of disk space.
+std::pair<HANDLE, DWORD> CreateGuestFileSection(const std::filesystem::path& directory,
+                                                size_t bytes, HANDLE& backing_file) {
+    wchar_t volume[MAX_PATH]{};
+    wchar_t filesystem[MAX_PATH]{};
+    if (!GetVolumePathNameW(directory.c_str(), volume, MAX_PATH) ||
+        !GetVolumeInformationW(volume, nullptr, 0, nullptr, nullptr, nullptr, filesystem,
+                               MAX_PATH)) {
+        return {nullptr, GetLastError()};
+    }
+    if (GetDriveTypeW(volume) != DRIVE_FIXED || _wcsicmp(filesystem, L"NTFS") != 0) {
+        return {nullptr, ERROR_NOT_SUPPORTED};
+    }
+    constexpr ULONGLONG DiskMargin = 2ULL << 30;
+    ULARGE_INTEGER free{};
+    if (!GetDiskFreeSpaceExW(directory.c_str(), &free, nullptr, nullptr)) {
+        return {nullptr, GetLastError()};
+    }
+    if (free.QuadPart < bytes || free.QuadPart - bytes < DiskMargin) {
+        return {nullptr, ERROR_DISK_FULL};
+    }
+
+    PSECURITY_DESCRIPTOR descriptor{};
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;;FA;;;OW)(A;;FA;;;SY)", SDDL_REVISION_1, &descriptor, nullptr)) {
+        return {nullptr, GetLastError()};
+    }
+    SCOPE_EXIT { LocalFree(descriptor); };
+    SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), descriptor, FALSE};
+    static std::atomic<unsigned> serial{};
+    const auto path = directory / (L"fritchii-guest-" + std::to_wstring(GetCurrentProcessId()) +
+                                   L"-" + std::to_wstring(GetTickCount64()) + L"-" +
+                                   std::to_wstring(serial.fetch_add(1)) + L".tmp");
+    const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE, 0,
+                                    &attributes, CREATE_NEW,
+                                    FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_FLAG_DELETE_ON_CLOSE,
+                                    nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return {nullptr, GetLastError()};
+    }
+    auto close_file = SCOPE_GUARD { CloseHandle(file); };
+    // A new NTFS file has zero valid data. Extend EOF normally so every unwritten byte reads
+    // zero. Sparse/compressed files cannot guarantee the space needed by later guest writes.
+    FILE_BASIC_INFO basic{};
+    if (!GetFileInformationByHandleEx(file, FileBasicInfo, &basic, sizeof(basic))) {
+        return {nullptr, GetLastError()};
+    }
+    if ((basic.FileAttributes & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE)) != 0) {
+        return {nullptr, ERROR_NOT_SUPPORTED};
+    }
+    FILE_ALLOCATION_INFO allocation{};
+    allocation.AllocationSize.QuadPart = static_cast<LONGLONG>(bytes);
+    FILE_END_OF_FILE_INFO end{};
+    end.EndOfFile = allocation.AllocationSize;
+    if (!SetFileInformationByHandle(file, FileAllocationInfo, &allocation, sizeof(allocation)) ||
+        !SetFileInformationByHandle(file, FileEndOfFileInfo, &end, sizeof(end))) {
+        return {nullptr, GetLastError()};
+    }
+    FILE_STANDARD_INFO actual{};
+    if (!GetFileInformationByHandleEx(file, FileStandardInfo, &actual, sizeof(actual)) ||
+        !GetDiskFreeSpaceExW(directory.c_str(), &free, nullptr, nullptr)) {
+        return {nullptr, GetLastError()};
+    }
+    if (actual.AllocationSize.QuadPart < allocation.AllocationSize.QuadPart ||
+        free.QuadPart < DiskMargin) {
+        return {nullptr, ERROR_DISK_FULL};
+    }
+    // Keep exclusive ownership and the allocated clusters until all guest aliases are unmapped.
+    const HANDLE section = CreateFileMappingW(file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+    if (section) {
+        backing_file = file;
+        close_file.Cancel();
+    }
+    return {section, section ? ERROR_SUCCESS : GetLastError()};
+}
+
 /// The views of a reserved section, for ReservedPageHandler.
 struct ReservedViews {
     std::atomic<bool> active{};
@@ -270,6 +351,25 @@ public:
         }
 
         reserved = ReserveGuestMemory();
+        if (const char* mode = std::getenv("FRITCHII_FILE_BACKED_GUEST"); mode && mode[0] == '1') {
+            std::error_code error;
+            const auto directory = std::filesystem::temp_directory_path(error);
+            const auto [section, status] =
+                error ? std::pair<HANDLE, DWORD>{nullptr, static_cast<DWORD>(error.value())}
+                      : CreateGuestFileSection(directory, backing_size, backing_file);
+            if (section) {
+                backing_handle = section;
+                file_backed = true;
+                reserved = false;
+                LOG_INFO(HW_Memory, "FRITCHII_FILE_BACKED_GUEST: {} MiB of guest memory backed "
+                                    "by a private temporary NTFS file",
+                         backing_size >> 20);
+            } else {
+                LOG_WARNING(HW_Memory, "Guest file backing unavailable (error {}), using the "
+                                       "pagefile-backed section",
+                            status);
+            }
+        }
         // Allocate backing file map (SEC_RESERVE with EDEN_NX2_SEC_RESERVE). SEC_COMMIT charges all of it to the commit limit up front, and
         // when the free commit is only just above its size the call fails with
         // ERROR_NO_SYSTEM_RESOURCES without growing a system-managed page file. The emulator then
@@ -383,8 +483,22 @@ public:
         const Common::Nx2Hitch::Scope timed{Common::Nx2Hitch::Cause::HostUnmap, length}; // before the lock
         std::scoped_lock lock{placeholder_mutex};
 
-        // Unmap until there are no more placeholders
-        while (UnmapOnePlaceholder(virtual_offset, length)) {
+        // A whole single view disappears in one kernel call. Partial unmaps rebuild the
+        // survivors, so exclude fast protections until their final views are in place.
+        const size_t virtual_end = virtual_offset + length;
+        const auto [first, end] = placeholders.equal_range({virtual_offset, virtual_end});
+        if (first == end) {
+            return;
+        }
+        std::unique_lock protect_lock{protect_mutex, std::defer_lock};
+        if (std::next(first) != end || first->lower() < virtual_offset ||
+            first->upper() > virtual_end) {
+            protect_lock.lock();
+        }
+        for (auto it = first; it != end;) {
+            // Advance before removing the current view. Any reinserted survivors lie outside
+            // the requested range and must not be visited.
+            UnmapPlaceholder(it++, virtual_offset, virtual_end);
         }
     }
 
@@ -409,13 +523,16 @@ public:
         // making or taking apart, or a range across views): those take the lock below, which
         // gives each view of the range the same flags. Map and Unmap hold the lock across their
         // kernel calls, which slow down when the game maps memory in bulk (zone changes), and
-        // the write-trap protections, thousands a second, queued behind them. Any interleaving
-        // ends as a Protect done wholly before or after the Map or Unmap: a view in place is the
-        // range's final view, a placeholder sends the call to the locked path.
+        // the write-trap protections, thousands a second, queued behind them. Only operations
+        // that change several views or replace their survivors exclude this fast path.
         const bool unlocked = ProtectUnlocked();
         if (unlocked) {
+            std::shared_lock protect_lock{protect_mutex};
             DWORD old_flags{};
-            if (VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags)) {
+            const bool protected_view =
+                VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags) != 0;
+            protect_lock.unlock();
+            if (protected_view) {
                 NoteProtect(true);
                 return;
             }
@@ -425,6 +542,12 @@ public:
             NoteProtect(false);
         }
         auto [it, end] = placeholders.equal_range({virtual_offset, virtual_end});
+        // Prevent two consecutive fast protections slipping between the individual view updates
+        // and producing a mixture of flags that no ordering of the three operations permits.
+        std::unique_lock protect_lock{protect_mutex, std::defer_lock};
+        if (it != end && std::next(it) != end) {
+            protect_lock.lock();
+        }
         while (it != end) {
             const size_t offset = (std::max)(it->lower(), virtual_offset);
             const size_t protect_length = (std::min)(it->upper(), virtual_end) - offset;
@@ -515,6 +638,7 @@ public:
     u8* backing_base{};
     u8* virtual_base{};
     bool reserved{}; ///< EDEN_NX2_SEC_RESERVE: the section was created with SEC_RESERVE
+    bool file_backed{};
 
 private:
     /// Release all resources in the object
@@ -547,21 +671,21 @@ private:
         if (!CloseHandle(backing_handle)) {
             LOG_CRITICAL(HW_Memory, "Failed to free backing memory file handle");
         }
+        if (backing_file != INVALID_HANDLE_VALUE) {
+            CloseHandle(backing_file);
+            backing_file = INVALID_HANDLE_VALUE;
+        }
     }
 
-    /// Unmap one placeholder in the given range (partial unmaps are supported)
-    /// Return true when there are no more placeholders to unmap
-    bool UnmapOnePlaceholder(size_t virtual_offset, size_t length) {
-        const auto it = placeholders.find({virtual_offset, virtual_offset + length});
+    /// Unmap the part of this placeholder inside [virtual_offset, virtual_end).
+    void UnmapPlaceholder(boost::icl::separate_interval_set<size_t>::iterator it,
+                          size_t virtual_offset, size_t virtual_end) {
         const auto begin = placeholders.begin();
         const auto end = placeholders.end();
-        if (it == end) {
-            return false;
-        }
         const size_t placeholder_begin = it->lower();
         const size_t placeholder_end = it->upper();
         const size_t unmap_begin = (std::max)(virtual_offset, placeholder_begin);
-        const size_t unmap_end = (std::min)(virtual_offset + length, placeholder_end);
+        const size_t unmap_end = (std::min)(virtual_end, placeholder_end);
         ASSERT(unmap_begin >= placeholder_begin && unmap_begin < placeholder_end);
         ASSERT(unmap_end <= placeholder_end && unmap_end > placeholder_begin);
 
@@ -619,7 +743,6 @@ private:
             TrackPlaceholder(unmap_end, host_offset + unmap_end - placeholder_begin,
                              placeholder_end - unmap_end);
         }
-        return true;
     }
 
     void MapView(size_t virtual_offset, size_t host_offset, size_t length) {
@@ -665,7 +788,8 @@ private:
     }
 
     HANDLE process{};        ///< Current process handle
-    HANDLE backing_handle{}; ///< File based backing memory
+    HANDLE backing_handle{}; ///< Section shared by the backing and fastmem views
+    HANDLE backing_file{INVALID_HANDLE_VALUE}; ///< Optional delete-on-close guest file
 
     DynamicLibrary kernelbase_dll;
     PFN_CreateFileMapping2 pfn_CreateFileMapping2{};
@@ -674,6 +798,7 @@ private:
     PFN_UnmapViewOfFile2 pfn_UnmapViewOfFile2{};
 
     std::mutex placeholder_mutex;                                 ///< Mutex for placeholders
+    std::shared_mutex protect_mutex; ///< Only multi-step updates need exclusive access.
     boost::icl::separate_interval_set<size_t> placeholders;       ///< Mapped placeholders
     ::Common::unordered_map<size_t, size_t> placeholder_host_pointers; ///< Placeholder backing offset
 };
@@ -1225,6 +1350,14 @@ HostMemory::~HostMemory() {
 HostMemory::HostMemory(HostMemory&&) noexcept = default;
 
 HostMemory& HostMemory::operator=(HostMemory&&) noexcept = default;
+
+bool HostMemory::UsesFileBacking() const noexcept {
+#ifdef _WIN32
+    return impl && impl->file_backed;
+#else
+    return false;
+#endif
+}
 
 void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms, bool separate_heap) {
 #if !(defined(__OPENORBIS__) || defined(__managarm__))

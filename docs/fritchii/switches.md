@@ -174,6 +174,17 @@ back. "Page table commit (n): <table> by <caller> committed K KiB of entries for
 every call that commits 1 MiB or more of a table at once (the first 64, then every 64th): they name
 the caller that filled it (protect, walk, mark debug, mark cached, map; the GPU table's maps).
 
+### FRITCHII_FILE_BACKED_GUEST
+
+The personal RTX 2060 Windows package sets this to `1`. It backs the emulated RAM with a
+private temporary file on a local NTFS volume. The 12 GB emulated RAM setting needs 14 GiB of
+temporary disk space, including the emulator's extra backing space. Windows releases that space
+when the emulator exits. Guest RAM and image settings use the same values as before.
+
+At launch the emulator checks for space for the entire file plus a 2 GiB margin. If it cannot
+create the file, it logs the reason and uses its usual paging-file-backed memory. Setting this
+switch to `0` selects that mode explicitly.
+
 ### FRITCHII_RAM_GPU_ENTRIES
 
 TEST, off by default (helper BE, 2026-11-16). Boot. Each GPU address space (Tegra::MemoryManager)
@@ -463,8 +474,9 @@ Zora's Domain facing King Zora, the view must follow the camera.
 
 ### FRITCHII_PROTECT_UNLOCKED
 
-On by default on every driver since 2026-11-18 (owner: a briefly late object beats a freeze; RTX 4080 market toggle 70.1 / 71.3 fps, no cost); first AMD/Intel only. (Helper AK, 2026-11-15, port of zortos293/Lichii #1780 by Reiixan); live,
-FRITCHII_PROTECT_UNLOCKED=1 turns it on (Windows only). HostMemory's Protect (the write traps on
+Enabled in the personal RTX 2060 Windows package. The implementation otherwise defaults to the
+locked path. This Windows switch comes from Reiixan's zortos293/Lichii #1780. Setting it to `1`
+enables the fast path. HostMemory's Protect (the write traps on
 GPU-cached guest memory, 12,000-28,000 calls a second in OoT) took the placeholder lock before every
 VirtualProtect, and Map/Unmap hold that lock across their kernel calls, which slow from ~10 us to
 ~250 us while the game maps memory in bulk (zone changes): protections queued behind them and the

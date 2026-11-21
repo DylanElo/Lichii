@@ -9,8 +9,12 @@
 #include <catch2/catch_test_macros.hpp>
 
 #ifdef _WIN32
+#include <cstdlib>
+#include <filesystem>
+#include <string>
 #include <windows.h>
 #include <psapi.h>
+#include "common/scope_exit.h"
 #else
 #include <unistd.h>
 #endif
@@ -305,5 +309,40 @@ TEST_CASE("HostMemory: Trim zero pages keeps contents", "[common]") {
     REQUIRE(all(view + 2 * Page, 0));
     REQUIRE(all(view + 3 * Page, 0));
     REQUIRE(all(backing + 0x400000, 0));
+}
+
+TEST_CASE("HostMemory: NTFS-backed fastmem preserves aliases across remaps", "[common]") {
+    const auto directory = std::filesystem::temp_directory_path();
+    wchar_t volume[MAX_PATH]{};
+    wchar_t filesystem[MAX_PATH]{};
+    ULARGE_INTEGER available{};
+    if (!GetVolumePathNameW(directory.c_str(), volume, MAX_PATH) ||
+        GetDriveTypeW(volume) != DRIVE_FIXED ||
+        !GetVolumeInformationW(volume, nullptr, 0, nullptr, nullptr, nullptr, filesystem, MAX_PATH) ||
+        _wcsicmp(filesystem, L"NTFS") != 0 ||
+        !GetDiskFreeSpaceExW(directory.c_str(), &available, nullptr, nullptr) ||
+        available.QuadPart < 2_GiB + 8_MiB ||
+        (GetFileAttributesW(directory.c_str()) & FILE_ATTRIBUTE_COMPRESSED) != 0) {
+        SKIP("Requires an uncompressed local NTFS temp directory with 2 GiB of spare space");
+    }
+    constexpr auto Switch = "FRITCHII_FILE_BACKED_GUEST";
+    const char* value = std::getenv(Switch);
+    const std::string previous = value ? value : "";
+    REQUIRE(_putenv_s(Switch, "1") == 0);
+    SCOPE_EXIT { _putenv_s(Switch, previous.c_str()); };
+    HostMemory mem(4_MiB, 8_MiB);
+    REQUIRE(mem.UsesFileBacking());
+    REQUIRE_FALSE(mem.CommitsOnUse());
+    mem.Map(0x5000, 0x3000, 0x1000, PERMS, HEAP);
+    mem.Map(0x8000, 0x3000, 0x1000, PERMS, HEAP);
+    auto* guest = mem.VirtualBasePointer();
+    REQUIRE(guest[0x5035] == 0);
+    guest[0x8035] = 71;
+    mem.Protect(0x5000, 0x1000, Common::MemoryPermission::Read);
+    REQUIRE(guest[0x5035] == 71);
+    mem.Unmap(0x5000, 0x1000, HEAP);
+    mem.Map(0x5000, 0x1000, 0x1000, PERMS, HEAP);
+    REQUIRE(guest[0x5035] == 0);
+    REQUIRE(mem.BackingBasePointer()[0x3035] == 71);
 }
 #endif

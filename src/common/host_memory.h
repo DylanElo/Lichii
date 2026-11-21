@@ -141,6 +141,9 @@ public:
         return commit_on_use;
     }
 
+    /// Whether Windows is paging the shared guest section directly to a private temporary file.
+    [[nodiscard]] bool UsesFileBacking() const noexcept;
+
     /// The section's commit state, for the memory log.
     struct CommitStats {
         bool reserved{};        ///< EDEN_NX2_SEC_RESERVE is on
