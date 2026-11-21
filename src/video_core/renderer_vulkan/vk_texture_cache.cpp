@@ -3766,6 +3766,10 @@ void TextureCacheRuntime::TickFrame() {
         pending_byte_addressed_shadows.pop_front();
     }
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
+    if (image_pool_frame % 600 == 0 && ordered_transcode_reuses != 0) {
+        LOG_INFO(Render_Vulkan, "ASTC decode scratch: {} pending images reused in queue order",
+                 std::exchange(ordered_transcode_reuses, 0U));
+    }
     // Finished decode images wait for the next texture of their shape, up to this much memory.
     static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
     const auto decode_bytes = [](const PendingTranscode& t) {
@@ -6167,14 +6171,30 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // A decode image of the same shape the GPU is done with: title 1's title screen decodes
     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
-    const auto reusable = std::ranges::find_if(free_transcodes, [&](const PendingTranscode& t) {
+    const auto same_shape = [&](const PendingTranscode& t) {
         return t.width == width && t.height == height && t.levels == levels && t.layers == layers;
-    });
+    };
     PendingTranscode pending;
-    if (reusable != free_transcodes.end()) {
+    bool ordered_reuse{};
+    if (const auto reusable = std::ranges::find_if(free_transcodes, same_shape);
+        reusable != free_transcodes.end()) {
         pending = std::move(*reusable);
         free_transcodes.erase(reusable);
-    } else {
+    } else if (device.GetDriverID() == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
+               device.GetDeviceID() == 0x1f11) {
+        // Area loads can decode many textures before TickFrame retires the scratch images. Only
+        // the main queue's ASTC decoder and BC encoder use this private RGBA8 image. Its last
+        // access is a compute shader read; the initialized-image barrier orders that read before
+        // the next decode writes. The compressed copy uses a separate output buffer.
+        const auto previous = std::ranges::find_if(pending_transcodes, same_shape);
+        if (previous != pending_transcodes.end()) {
+            pending = std::move(*previous);
+            pending_transcodes.erase(previous);
+            ordered_reuse = true;
+            ++ordered_transcode_reuses;
+        }
+    }
+    if (!pending.image) {
         const VkImageCreateInfo decode_ci{
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .pNext = nullptr,
@@ -6230,7 +6250,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
         ASTCDecoderPass::Target{
             .image = *pending.image,
             .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .initialized = false,
+            .initialized = ordered_reuse,
             .level_view = [&pending](s32 level) { return *pending.views[level]; },
             .wait = true,
         },
