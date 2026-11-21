@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <map>
 #include <vector>
 
 #include <boost/icl/interval_set.hpp>
@@ -25,15 +26,17 @@ public:
     ::Common::unordered_set<IR::LocationDescriptor> InvalidateRanges(const boost::icl::interval_set<P>& invalidated);
 
 private:
-    /// The guest code [first, last] a block was translated from. Code is invalidated rarely (when
-    /// it is unmapped or reprotected), so a list scanned then costs least: an interval map of
-    /// block sets held ~300 bytes per block.
+    /// Each block is indexed once. Most blocks fit within a 64 KiB region, so a small guest
+    /// invalidation only examines that region and the few blocks spanning a region boundary.
+    static constexpr unsigned RegionBits = 16;
+    template<typename Address>
     struct Range {
-        P first;
-        P last;
+        Address first;
+        Address last;
         IR::LocationDescriptor location;
     };
-    std::vector<Range> ranges;
+    std::map<P, std::vector<Range<u16>>> regions;
+    std::vector<Range<P>> spanning;
 };
 
 }  // namespace Dynarmic::Backend
