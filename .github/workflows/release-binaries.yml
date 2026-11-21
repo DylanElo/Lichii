@@ -292,6 +292,7 @@ jobs:
         run: |
           echo "CC=clang-cl" >> "$GITHUB_ENV"
           echo "CXX=clang-cl" >> "$GITHUB_ENV"
+          echo "FRITCHII_LLVM_BIN=$(cygpath -am "$(dirname "$(command -v clang-cl)")")" >> "$GITHUB_ENV"
           echo "TITLEBARFORMATIDLE=Lichii RTX 2060 | v6.2 | ${GITHUB_SHA:0:10}" >> "$GITHUB_ENV"
 
       - name: Configure Windows
@@ -307,7 +308,7 @@ jobs:
           -DYUZU_ROOM_STANDALONE=OFF
           -DYUZU_USE_BUNDLED_QT=OFF
           -DYUZU_USE_BUNDLED_SDL3=ON
-          ${{ matrix.fritchii && '-DFRITCHII_RENDER_THINLTO=ON -DCMAKE_AR=llvm-lib -DCMAKE_LINKER=lld-link' || '' }}
+          ${{ matrix.fritchii && '-DFRITCHII_RENDER_THINLTO=ON "-DCMAKE_AR=$FRITCHII_LLVM_BIN/llvm-lib.exe" "-DCMAKE_LINKER=$FRITCHII_LLVM_BIN/lld-link.exe"' || '' }}
           -DENABLE_UPDATE_CHECKER=${{ matrix.fritchii && 'OFF' || 'ON' }}
           -DENABLE_WERROR=${{ matrix.fritchii && 'OFF' || 'ON' }}
           -DLICHII_BUILD_TAG=${{ !matrix.fritchii && format('build-{0}', github.run_number) || '' }}
