@@ -97,15 +97,23 @@ private:
     std::string data;
 };
 
+// This graphics state first appeared in the Kakariko run that waited 902 ms for a pipeline.
+// Its fragment program took 934 ms to compile in that interval on the RTX 2060.
+inline constexpr u64 KakarikoGraphicsState = 0x74a0235b7718dce2ULL;
+inline constexpr u64 KakarikoFragmentProgram = 0x2de2cc705d89e09fULL;
+
 class GraphicsPipelineLibraryCache {
 public:
     using Builder = std::function<GplLibrary()>;
 
     /// The library for `key`: built with `build` on this thread when nobody has built it yet,
-    /// waited for when another thread is building it. Null when its build failed (a failed key
-    /// is not retried). `name` (a shader hash) is only for the log.
+    /// waited for when another thread is building it. A failed personal prewarm can be retried by
+    /// the next live lookup. `name` is the program hash used in the log.
     std::shared_ptr<const GplLibrary> GetOrCreate(GplPart part, const std::string& key,
-                                                  const Builder& build, u64 name);
+                                                  const Builder& build, u64 name,
+                                                  bool retain_fragment);
+
+    void ReportPreparedFragment(u64 pipeline_hash, const std::shared_ptr<const GplLibrary>& library);
 
     /// While set on a thread, libraries it builds are not kept in the cache (the graphics
     /// warm-up: only the driver's disk cache keeps them, 60,000 kept libraries would not fit).
@@ -133,6 +141,8 @@ private:
 
     std::mutex mutex;
     std::unordered_map<std::string, std::shared_ptr<Entry>> entries;
+    // The one personal prewarm entry. Protected by mutex, including while its owner builds.
+    std::shared_ptr<Entry> prepared_fragment;
 
     std::array<std::atomic<u32>, 2> built{};
     std::array<std::atomic<u32>, 2> failed{};

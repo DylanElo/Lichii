@@ -123,6 +123,7 @@ struct GraphicsPipelineLibraryParams {
     /// pipeline built from kept SPIR-V, timed for TakeKeptBuildStats. Runtime pipelines whose
     /// SPIR-V a worker emits are new to the driver anyway, so they are not counted.
     bool prepared{};
+    bool retain_fragment{}; ///< Keep this one personal prewarm entry across bulk warm-up and trims.
 };
 
 /// Mesh emulation on a device without VK_EXT_mesh_shader: the mesh program (stage 0) is built as
@@ -244,6 +245,10 @@ public:
     /// The sampled textures of the last configured draw, kept while a sampled frame dump runs.
     std::span<const SampledImage> SampledImages() const noexcept {
         return sampled_images;
+    }
+
+    std::shared_ptr<const GplLibrary> FragmentLibrary() const {
+        return shader_libraries[1];
     }
 
     bool SupportsAlphaToCoverage() const noexcept {
@@ -700,7 +705,7 @@ private:
     /// Library build (EDEN_NX2_GPL): gets or builds the two shader libraries, then (unless
     /// libraries_only) links them with this pipeline's vertex input and fragment output parts.
     /// False when a library failed; the caller then builds the pipeline the monolithic way.
-    bool MakeLibraryPipeline(VkRenderPass render_pass);
+    bool MakeLibraryPipeline(VkRenderPass render_pass, bool retain_fragment);
 
     GplLibrary MakeShaderLibrary(GplPart part, const PipelineStates& states,
                                  VkRenderPass render_pass) const;

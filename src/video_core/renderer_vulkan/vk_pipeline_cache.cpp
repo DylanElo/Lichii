@@ -5887,7 +5887,7 @@ void PipelineCache::StartPrecompiled(u64 title_id, const std::filesystem::path& 
         bool force = false;
         for (;;) {
             shader_notify.PrecompileStarted();
-            PreparePrecompiled(base_dir, stop, {}, file, force);
+            PreparePrecompiled(title_id, base_dir, stop, {}, file, force);
             shader_notify.SetWarmProgress(0, 0, 0);
             shader_notify.SetPrecompilePending(false);
             shader_notify.PrecompileEnded();
@@ -5932,7 +5932,7 @@ void PipelineCache::CanonicalizeNativeKey(
     key.state.CanonicalizeNative(mask);
 }
 
-void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
+void PipelineCache::PreparePrecompiled(u64 title_id, const std::filesystem::path& base_dir,
                                        std::stop_token stop_loading,
                                        const VideoCore::DiskResourceLoadCallback& callback,
                                        const std::filesystem::path& file, bool force) {
@@ -6015,6 +6015,12 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                 LOG_INFO(Render_Vulkan, "Precompiled pipelines already prepared for this driver");
                 const int check_mode = PrepComputeCheckMode();
                 const auto index = keep ? KeptIndex() : nullptr;
+                const char* enable = std::getenv("FRITCHII_KAKARIKO_FRAGMENT");
+                if (index && enable && std::string_view{enable} == "1" &&
+                    PreferSlowOot2060Graphics(device, title_id) &&
+                    !stop_loading.stop_requested() && !warm_cancel) {
+                    WarmKakarikoFragment(*index);
+                }
                 if (check_mode == 0 || !index || index->ComputeCount() == 0) {
                     return;
                 }
@@ -6956,6 +6962,77 @@ bool PipelineCache::LoadKept(const std::filesystem::path& kept, const std::files
         kept_available = true;
     }
     return true;
+}
+
+void PipelineCache::WarmKakarikoFragment(const PrecompiledKept::Index& index) try {
+    if (!device.IsExtGraphicsPipelineLibrarySupported()) {
+        return;
+    }
+    const auto records = index.Graphics(KakarikoGraphicsState);
+    if (records.empty()) {
+        return;
+    }
+    const auto& record = records.front();
+    constexpr size_t fragment = Maxwell::MaxShaderStage - 1;
+    if (record.env_count != 2 || !(record.flags & PrecompiledKept::FlagLibraries)) {
+        return;
+    }
+    // Re-read the same record the checked index names. The kept table uses device-normalized keys.
+    u64 offset{};
+    std::array<u8, 12> header{};
+    const size_t position = static_cast<size_t>(&record - index.AllGraphics().data());
+    if (!index.RecordOffset(false, position, offset) || !index.ReadPrecompiled(offset, header) ||
+        header[0] != 0 || header[1] != record.env_count ||
+        std::memcmp(header.data() + 4, record.envs.data(), 2 * sizeof(u32)) != 0) {
+        return;
+    }
+    GraphicsPipelineCacheKey key{};
+    if (!index.ReadPrecompiled(offset + header.size(),
+                               std::span{reinterpret_cast<u8*>(&key), sizeof(key)})) {
+        return;
+    }
+    RecordedKeyForThisDevice(key);
+    if (key.Hash() != KakarikoGraphicsState ||
+        key.unique_hashes[fragment + 1] != KakarikoFragmentProgram) {
+        return;
+    }
+
+    // All stage infos define the same state as a linked pipeline. Supplying just the fragment
+    // module to the library-only builder omits the vertex library, interface libraries and link.
+    auto infos = std::make_unique<std::array<Shader::Info, Maxwell::MaxShaderStage>>();
+    std::array<const Shader::Info*, Maxwell::MaxShaderStage> info_ptrs{};
+    for (size_t stage = 0; stage < infos->size(); ++stage) {
+        if (key.unique_hashes[stage + 1] != 0) {
+            if (!index.ReadInfo(record.infos[stage], (*infos)[stage])) {
+                return;
+            }
+            info_ptrs[stage] = &(*infos)[stage];
+        }
+    }
+    std::vector<u32> words;
+    if (!index.ReadSpirv(record.spirv[fragment], words)) {
+        return;
+    }
+    GraphicsPipeline::LibraryParams params{.library_cache = &graphics_libraries,
+                                           .libraries_only = true,
+                                           .retain_fragment = true};
+    std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
+    modules[fragment] = BuildStageModule(device, words, key.unique_hashes[fragment + 1], fragment,
+                                         &params.spirv_hashes[fragment]);
+    const auto begin = std::chrono::steady_clock::now();
+    auto warm = std::make_unique<GraphicsPipeline>(
+        scheduler, buffer_cache, texture_cache, WarmPipelineCache(), nullptr, device,
+        descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, draw_templates, nullptr,
+        nullptr, render_pass_cache, key, std::move(modules), info_ptrs,
+        GraphicsPipeline::EmitStagesFunc{}, params);
+    if (warm->FragmentLibrary()) {
+        const auto elapsed = std::chrono::steady_clock::now() - begin;
+        LOG_INFO(Render_Vulkan, "RTX 2060 prepared fragment {:016x} for graphics {:016x} in {:.1f} ms",
+                 KakarikoFragmentProgram, KakarikoGraphicsState,
+                 std::chrono::duration<double, std::milli>(elapsed).count());
+    }
+} catch (const std::exception& error) {
+    LOG_WARNING(Render_Vulkan, "Kakariko fragment prewarm failed: {}", error.what());
 }
 
 void PipelineCache::NotePrecompiledMiss(const char* reason) {

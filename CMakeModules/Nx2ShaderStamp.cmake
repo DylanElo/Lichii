@@ -39,6 +39,9 @@ set(SameAsReleased "096d887be421a8e2=143b6220486fb09b;6f72127d45416a88=3dc8b3ea0
 # The RTX 2060 temporary compute module is created only on a cold dispatch. Preparation,
 # boot builds and the optimized module stored for the next launch still use v6.2's SPIR-V.
 list(APPEND SameAsReleased "b991a1b78cf8ace2=143b6220486fb09b" "ebceb2df01424f05=3dc8b3ea00f9b392")
+# The personal RTX 2060 prewarm retains one existing fragment library by its full key.
+# Shader bytes and Vulkan creation parameters for prepared pipelines are unchanged.
+list(APPEND SameAsReleased "1a7e602e812d20f8=143b6220486fb09b" "08023cdea30e53f0=3dc8b3ea00f9b392")
 
 # The SHA-256 of a file as if its FRITCHII_STAMP_SKIP blocks weren't there, line endings as in the
 # file. file(READ) gives LF line endings on every platform, so CRLF goes back on before hashing.

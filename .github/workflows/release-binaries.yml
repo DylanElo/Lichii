@@ -505,6 +505,8 @@ jobs:
             'FRITCHII_PROTECT_UNLOCKED=1'
             '# Park the command front end during long waits for GPU ring progress.'
             'FRITCHII_LONG_FRONT_PARK=1'
+            '# Prepare the existing Kakariko fragment library before the first matching draw.'
+            'FRITCHII_KAKARIKO_FRAGMENT=1'
           )
 
       # A dynamic MinGW build is not portable on its own: windeployqt6 brings the Qt libraries and

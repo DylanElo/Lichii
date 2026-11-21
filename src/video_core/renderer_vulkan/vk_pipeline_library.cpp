@@ -39,7 +39,7 @@ bool GplOptimizeEnabled() {
 }
 
 std::shared_ptr<const GplLibrary> GraphicsPipelineLibraryCache::GetOrCreate(
-    GplPart part, const std::string& key, const Builder& build, u64 name) {
+    GplPart part, const std::string& key, const Builder& build, u64 name, bool retain_fragment) {
     const size_t index = static_cast<size_t>(part);
     std::shared_ptr<Entry> entry;
     bool owner = false;
@@ -51,6 +51,9 @@ std::shared_ptr<const GplLibrary> GraphicsPipelineLibraryCache::GetOrCreate(
             owner = true;
         }
         entry = it->second;
+        if (retain_fragment) {
+            prepared_fragment = entry;
+        }
     }
     if (!owner) {
         std::unique_lock lock{entry->mutex};
@@ -101,15 +104,30 @@ std::shared_ptr<const GplLibrary> GraphicsPipelineLibraryCache::GetOrCreate(
         entry->done = true;
     }
     entry->condition.notify_all();
-    if (no_retain_on_thread) {
-        // Threads already waiting on the entry hold it; later lookups build again, which the
-        // driver's disk cache answers in about a millisecond.
+    if (no_retain_on_thread || (retain_fragment && !library)) {
+        // A bulk warm caller can own a build that the personal prewarm joined. Preserve that
+        // exact entry on success. A failed personal build can be retried by later live draws.
         std::scoped_lock lock{mutex};
-        if (const auto it = entries.find(key); it != entries.end() && it->second == entry) {
+        if (const auto it = entries.find(key); it != entries.end() && it->second == entry &&
+                                                (!library || prepared_fragment != entry)) {
             entries.erase(it);
         }
     }
     return library;
+}
+
+void GraphicsPipelineLibraryCache::ReportPreparedFragment(
+    u64 pipeline_hash, const std::shared_ptr<const GplLibrary>& library) {
+    std::scoped_lock lock{mutex};
+    if (!prepared_fragment || pipeline_hash != KakarikoGraphicsState) {
+        return;
+    }
+    std::scoped_lock entry_lock{prepared_fragment->mutex};
+    if (prepared_fragment->done && prepared_fragment->library) {
+        LOG_INFO(Render_Vulkan, "RTX 2060 prepared fragment: graphics {:016x}, fragment {:016x}, "
+                                "same Vulkan library {}",
+                 pipeline_hash, KakarikoFragmentProgram, library == prepared_fragment->library);
+    }
 }
 
 void GraphicsPipelineLibraryCache::TrimUnused(size_t max_entries) {
@@ -124,7 +142,8 @@ void GraphicsPipelineLibraryCache::TrimUnused(size_t max_entries) {
         {
             std::scoped_lock entry_lock{entry.mutex};
             // Failed keys stay (they are not retried); a library only the map holds is unused.
-            unused = entry.done && entry.library && entry.library.use_count() == 1;
+            unused = it->second != prepared_fragment && entry.done && entry.library &&
+                     entry.library.use_count() == 1;
         }
         if (unused) {
             it = entries.erase(it);

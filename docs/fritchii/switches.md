@@ -1848,6 +1848,13 @@ condition is satisfied. Short waits retain their spin and yield behavior. The pe
 RTX 2060 package enables this option. Set it to 0 to compare the original behavior.
 An explicit `EDEN_NX2_PERF_ON=front_sleep` selects the existing general sleep mode.
 
+### FRITCHII_KAKARIKO_FRAGMENT
+
+Set to 1 at startup to prepare one Kakariko fragment library from an existing validated
+OoT shader cache on the RTX 2060 laptop GPU. The renderer checks the ordinary shader and
+render-state key when the game requests it. A log entry containing `same Vulkan library true`
+confirms that the pipeline reused the prepared library in that session.
+
 ### FRITCHII_HOSTTIMING_SPIN_BUDGET
 
 TEST, off by default (helper AS, 2026-11-15; idea from zortos293/Lichii #1733). Live, a percent of

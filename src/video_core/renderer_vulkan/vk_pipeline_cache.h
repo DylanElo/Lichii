@@ -542,6 +542,7 @@ private:
     /// spread over the index) translated again from their recorded environments with this build
     /// and its settings, and compared with the kept SPIR-V and infos. True when all are equal.
     bool CheckKeptSample(const PrecompiledKept::Index& index, std::string_view file_name);
+    void WarmKakarikoFragment(const PrecompiledKept::Index& index);
     /// FRITCHII_PREP_COMPUTE_CHECK: builds a few of the biggest kept compute pipelines the way a
     /// dispatch builds them (kept info and SPIR-V, same layout and flags) and times them. True
     /// when most took over the miss threshold: the driver's cache lost the prepared compute
@@ -681,7 +682,7 @@ private:
     /// the guest's shaders and find the driver's compiled code. Runs once per precompiled file,
     /// driver and release (or again when `force`). Fritchii runs it on precompile_thread,
     /// so `callback` (the loading screen in the ported feature) is empty and progress goes to ShaderNotify.
-    void PreparePrecompiled(const std::filesystem::path& base_dir, std::stop_token stop_loading,
+    void PreparePrecompiled(u64 title_id, const std::filesystem::path& base_dir, std::stop_token stop_loading,
                             const VideoCore::DiskResourceLoadCallback& callback,
                             const std::filesystem::path& file = {}, bool force = false);
     /// A graphics key read from the precompiled file, as draws key it on this device: its driver

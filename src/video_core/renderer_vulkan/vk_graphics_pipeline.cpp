@@ -856,7 +856,7 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics,
-                emit_stages = std::move(emit_stages)] {
+                retain_fragment = library_params.retain_fragment, emit_stages = std::move(emit_stages)] {
         const auto begin = std::chrono::steady_clock::now();
         SCOPE_EXIT {
             if (shader_notify) {
@@ -874,7 +874,7 @@ GraphicsPipeline::GraphicsPipeline(
                     spv_modules, [](const vk::ShaderModule& module) { return bool(module); });
                 bool made{};
                 try {
-                    made = MakeLibraryPipeline(render_pass);
+                    made = MakeLibraryPipeline(render_pass, retain_fragment);
                 } catch (const vk::Exception& exception) {
                     if (libraries_only) {
                         // Warm-up: counted by the warm-up and logged once at its end.
@@ -3925,7 +3925,7 @@ vk::Pipeline GraphicsPipeline::LinkLibraries(VkRenderPass render_pass, bool opti
     return linked_pipeline;
 }
 
-bool GraphicsPipeline::MakeLibraryPipeline(VkRenderPass render_pass) {
+bool GraphicsPipeline::MakeLibraryPipeline(VkRenderPass render_pass, bool retain_fragment) {
     PipelineStates states;
     FillStates(states);
     static constexpr std::array parts{GplPart::PreRasterization, GplPart::Fragment};
@@ -3947,7 +3947,11 @@ bool GraphicsPipeline::MakeLibraryPipeline(VkRenderPass render_pass) {
                                                            : key.unique_hashes[5];
         shader_libraries[index] = library_cache->GetOrCreate(
             part, ShaderLibraryKey(part, states, render_pass),
-            [&] { return MakeShaderLibrary(part, states, render_pass); }, name);
+            [&] { return MakeShaderLibrary(part, states, render_pass); }, name,
+            retain_fragment && part == GplPart::Fragment);
+        if (!libraries_only && part == GplPart::Fragment && name == KakarikoFragmentProgram) {
+            library_cache->ReportPreparedFragment(key.Hash(), shader_libraries[index]);
+        }
         if (!shader_libraries[index]) {
             return false;
         }
