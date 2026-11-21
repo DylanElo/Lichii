@@ -60,7 +60,7 @@ constexpr ScopeGuard<F> operator+(ScopeGuardOnExit, F&& f) {
  * This macro is similar to SCOPE_EXIT, except the object is caller managed. This is intended to be
  * used when the caller might want to cancel the ScopeExit.
  */
-#define SCOPE_GUARD detail::ScopeGuardOnExit() + [&]()
+#define SCOPE_GUARD ::detail::ScopeGuardOnExit() + [&]()
 
 /**
  * This macro allows you to conveniently specify a block of code that will run on scope exit. Handy
