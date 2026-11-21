@@ -467,6 +467,11 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     check_owner = check_owner || OneFollower::On();
     // 8.2: the front's waits read R's position (`played`), E keeps `consumed`.
     two_positions = OneFollower::On();
+    const char* park = std::getenv("FRITCHII_LONG_FRONT_PARK");
+    long_front_park = park && park[0] == '1' && !Nx2Perf::On(Nx2Perf::Opt::FrontSleep);
+    if (long_front_park) {
+        LOG_INFO(HW_GPU, "GPU split: target-aware front parking after 3 ms");
+    }
     ring = std::make_unique<u64[]>(RingWords);
     ++session;
     session_started = std::chrono::steady_clock::now();
@@ -583,6 +588,10 @@ void GpuSplit::Stop() {
     back_idle_at.store(~u64{0}, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
     front_waiting.store(false, std::memory_order_relaxed);
+    if (long_front_park) {
+        LOG_INFO(HW_GPU, "GPU split: {} front parks after 3 ms",
+                 front_park_count.exchange(0, std::memory_order_relaxed));
+    }
     // Run-ahead's positions are ring positions too; queued chunks' bytes are in guest memory.
     Runahead::Reset();
 }
@@ -784,7 +793,7 @@ void GpuSplit::Drain(DrainSite site) {
             NoteSiteWait(site, behind, Common::Nx2Hitch::NowNs() - begin_ns);
             return;
         }
-        Backoff(spins, write_position, on_engine);
+        Backoff(spins, write_position, on_engine, begin_ns);
     }
 }
 
@@ -2038,11 +2047,11 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
             NoteSiteWait(site, behind, Common::Nx2Hitch::NowNs() - begin_ns);
             return true;
         }
-        Backoff(spins, target, on_engine);
+        Backoff(spins, target, on_engine, begin_ns);
     }
 }
 
-void GpuSplit::Backoff(u32 spins, u64 target, bool on_engine) {
+void GpuSplit::Backoff(u32 spins, u64 target, bool on_engine, u64 begin_ns) {
     if (const int hardware_wait = Common::HardwareWaitMode(); hardware_wait != 0) [[unlikely]] {
         // FRITCHII_HWWAIT: the pause phase as 256 hardware waits of 64 pauses' time each (the
         // same wall time), on the position the wait reads first; a store to it ends the wait.
@@ -2060,7 +2069,20 @@ void GpuSplit::Backoff(u32 spins, u64 target, bool on_engine) {
         Pause();
         return;
     }
-    if (!Nx2Perf::On(Nx2Perf::Opt::FrontSleep) || !back_running.load(std::memory_order_acquire)) {
+    if (long_front_park) {
+        // Keep the short-wait policy. Sample wall time only every 64 yields.
+        if ((spins & 63) != 0 || Common::Nx2Hitch::NowNs() - begin_ns < 3'000'000) {
+            std::this_thread::yield();
+            return;
+        }
+        // The front publishes both fields to the producers through front_waiting below.
+        front_park_target.store(target, std::memory_order_relaxed);
+        front_park_on_engine.store(on_engine, std::memory_order_relaxed);
+    } else if (!Nx2Perf::On(Nx2Perf::Opt::FrontSleep)) {
+        std::this_thread::yield();
+        return;
+    }
+    if (!back_running.load(std::memory_order_acquire)) {
         std::this_thread::yield();
         return;
     }
@@ -2069,7 +2091,13 @@ void GpuSplit::Backoff(u32 spins, u64 target, bool on_engine) {
     front_waiting.store(true, std::memory_order_seq_cst);
     const u32 seen = front_wake.load(std::memory_order_seq_cst);
     // E's `consumed` store and R's `played` raise both wake the front (RaisePlayed).
-    if (!Reached(target, on_engine, std::memory_order_seq_cst)) {
+    // BackLoop increments front_wake when stopping. Recheck running after sampling the
+    // generation so a stop immediately before registration cannot strand this sleep.
+    if (back_running.load(std::memory_order_seq_cst) &&
+        !Reached(target, on_engine, std::memory_order_seq_cst)) {
+        if (long_front_park) {
+            front_park_count.fetch_add(1, std::memory_order_relaxed);
+        }
         front_wake.wait(seen, std::memory_order_seq_cst);
     }
     front_waiting.store(false, std::memory_order_relaxed);

@@ -1836,6 +1836,18 @@ each, longest L us; by part ms/s: head, pipeline cache, descriptor queues, fence
 texture cache, memory seam, buffer cache (E's)". Everything but the buffer cache part is what a
 posted frame end could take off E's parked time.
 
+When the slowest call lasts at least 20 ms, the next line reports how long before the log entry
+that call ended. Its breakdown gives the durations for that call, including the wait for the
+texture-cache lock, downloads, memory queries, collection, and deferred destruction.
+
+### FRITCHII_LONG_FRONT_PARK
+
+Set to 1 at startup to let the GPU command front end sleep when it has waited at least 3 ms
+for a ring position. The engine and render threads wake it when the original completion
+condition is satisfied. Short waits retain their spin and yield behavior. The personal Windows
+RTX 2060 package enables this option. Set it to 0 to compare the original behavior.
+An explicit `EDEN_NX2_PERF_ON=front_sleep` selects the existing general sleep mode.
+
 ### FRITCHII_HOSTTIMING_SPIN_BUDGET
 
 TEST, off by default (helper AS, 2026-11-15; idea from zortos293/Lichii #1733). Live, a percent of

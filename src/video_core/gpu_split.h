@@ -2181,7 +2181,7 @@ private:
     bool WaitFor(u64 target, DrainSite site);
 
     /// One step of a front wait for the back to consume `target` (`on_engine`: UsesEngine).
-    void Backoff(u32 spins, u64 target, bool on_engine);
+    void Backoff(u32 spins, u64 target, bool on_engine, u64 begin_ns);
     /// SiteOnEngine with the switch and the two positions on (once per wait).
     [[nodiscard]] bool UsesEngine(DrainSite site) const;
     /// Whether the front's wait for `target` is over: R played it, or with `on_engine` E ran it
@@ -2190,6 +2190,14 @@ private:
     /// After the back stored `consumed`: wakes a front sleeping in Backoff.
     void NotifyFront() {
         if (front_waiting.load(std::memory_order_seq_cst)) {
+            // Both producers call this after publishing their progress. An engine wait can
+            // finish on either producer, even if the last RaisePlayed did not advance played.
+            if (long_front_park &&
+                !Reached(front_park_target.load(std::memory_order_relaxed),
+                         front_park_on_engine.load(std::memory_order_relaxed),
+                         std::memory_order_seq_cst)) {
+                return;
+            }
             front_wake.fetch_add(1, std::memory_order_seq_cst);
             front_wake.notify_one();
         }
@@ -2946,6 +2954,10 @@ private:
     /// The front sleeps in Backoff (ported: instead of yielding).
     alignas(128) std::atomic<bool> front_waiting{};
     std::atomic<u32> front_wake{};
+    bool long_front_park{};
+    std::atomic<u64> front_park_target{};
+    std::atomic<bool> front_park_on_engine{};
+    std::atomic<u64> front_park_count{};
     std::jthread back_thread;
 };
 
