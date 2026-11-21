@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -532,6 +533,61 @@ void SwizzlePitchLinearImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr
     }
 }
 
+// A full native 2D block is a permutation of complete 64-byte by 8-row GOBs. Guard both
+// axes and the actual mip allocation: a partial final block or trailing alignment has padding
+// belonging to the guest that must survive the write.
+constexpr bool CompleteNativeWrite(Extent3D tiles, Extent3D block, u32 bytes_per_block,
+                                   u32 tile_width_spacing, size_t guest_bytes) {
+    if (tiles.width == 0 || tiles.height == 0 || tiles.depth != 1 || block.width != 0 ||
+        block.depth != 0 || block.height > 5 || tile_width_spacing != 0 ||
+        bytes_per_block == 0 || bytes_per_block > 16 ||
+        (bytes_per_block & (bytes_per_block - 1)) != 0) {
+        return false;
+    }
+    const u64 row_bytes = u64{tiles.width} * bytes_per_block;
+    return row_bytes % GOB_SIZE_X == 0 && tiles.height % (GOB_SIZE_Y << block.height) == 0 &&
+           guest_bytes % tiles.height == 0 && guest_bytes / tiles.height == row_bytes;
+}
+
+void NoteSwizzleDestination(bool complete, bool fragmented, size_t bytes) {
+    // Each calling thread owns its counters. Read the clock only on the first call and every
+    // 32 layers, and only under the existing frame-end diagnostic.
+    static const bool enabled = [] {
+        const char* value = std::getenv("FRITCHII_FRAME_END_TIMES");
+        return value && *value && *value != '0';
+    }();
+    if (!enabled) [[likely]] {
+        return;
+    }
+    struct Counts {
+        u64 layers{};
+        u64 avoided{};
+        u64 preserved{};
+        u64 direct{};
+        std::chrono::steady_clock::time_point last{};
+    };
+    static thread_local Counts counts;
+    if (!fragmented) {
+        counts.direct += bytes;
+    } else if (complete) {
+        counts.avoided += bytes;
+    } else {
+        counts.preserved += bytes;
+    }
+    if ((++counts.layers % 32) != 1) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (counts.last != std::chrono::steady_clock::time_point{} &&
+        now - counts.last < std::chrono::seconds{10}) {
+        return;
+    }
+    LOG_INFO(HW_GPU, "Texture writeback destinations (thread total): {} layers, fragmented "
+             "destination reads skipped {} bytes, preserved {} bytes, direct {} bytes",
+             counts.layers, counts.avoided, counts.preserved, counts.direct);
+    counts.last = now;
+}
+
 void SwizzleBlockLinearImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr,
                              const ImageInfo& info, const BufferImageCopy& copy,
                              std::span<const u8> input, Common::ScratchBuffer<u8>& tmp_buffer) {
@@ -564,15 +620,27 @@ void SwizzleBlockLinearImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr
                        tile_size.height, info.tile_width_spacing);
     const size_t subresource_size = sizes[level];
 
+    const bool native = gpu_memory.UsesNativeTiling();
+    const bool complete = native && info.type == ImageType::e2D &&
+                          copy.image_subresource.base_layer == 0 &&
+                          copy.image_subresource.num_layers == info.resources.layers &&
+                          copy.image_offset == Offset3D{} && copy.image_extent == level_size &&
+                          CompleteNativeWrite(num_tiles, block, bytes_per_block,
+                                              info.tile_width_spacing, subresource_size);
+    using Tegra::Memory::GuestMemoryFlags;
     for (s32 layer = 0; layer < info.resources.layers; ++layer) {
         const std::span<const u8> src = input.subspan(host_offset);
-        {
-            Tegra::Memory::GpuGuestMemoryScoped<u8,
-                                                Tegra::Memory::GuestMemoryFlags::UnsafeReadWrite>
-                dst(gpu_memory, gpu_addr + guest_offset, subresource_size, &tmp_buffer);
-
+        const auto write_layer = [&]<GuestMemoryFlags access>() {
+            Tegra::Memory::GpuGuestMemoryScoped<u8, access> dst(
+                gpu_memory, gpu_addr + guest_offset, subresource_size, &tmp_buffer);
             SwizzleTexture(dst, src, bytes_per_block, num_tiles.width, num_tiles.height,
-                           num_tiles.depth, block.height, block.depth, 1, gpu_memory.UsesNativeTiling());
+                           num_tiles.depth, block.height, block.depth, 1, native);
+            NoteSwizzleDestination(complete, dst.data() == tmp_buffer.data(), subresource_size);
+        };
+        if (complete) {
+            write_layer.template operator()<GuestMemoryFlags::UnsafeWrite>();
+        } else {
+            write_layer.template operator()<GuestMemoryFlags::UnsafeReadWrite>();
         }
 
         host_offset += host_bytes_per_layer;
